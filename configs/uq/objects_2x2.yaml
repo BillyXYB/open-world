@@ -1,0 +1,67 @@
+# 2x2 uncertainty registry for build_uq_dataset.py
+#
+# Two orthogonal uncertainty axes, realized by two different mechanisms:
+#
+#   variance   (aleatoric, irreducible) -- how widely the OUTCOME spreads when the
+#              hidden variable (object sliding friction) is drawn at random. This is
+#              MEASURED per object (a friction probe sweep) and then binned high/low.
+#              You may pin it per object with `variance_level: high|low` to override.
+#
+#   data       (epistemic, reducible)  -- how many TRAINING episodes the object gets.
+#              "large" objects are sampled many times, "small" few times, so the model
+#              sees them at different frequencies. This is the `data_level` field.
+#
+# Each generated episode is a distinct draw: the hidden variable mu is sampled from
+# `hidden_var.distribution`, so the `large` objects also COVER their outcome
+# distribution more densely (more data == more coverage, not just repetition).
+#
+# Each object is rendered with a fixed `color` so the texture identifies which set it
+# was sampled from (omit `color` to auto-assign a hue by cell).
+
+seed: 0
+res: 96
+fps: 20
+
+hidden_var:
+  name: object_sliding_friction   # the unobserved physical variable
+  distribution: loguniform        # loguniform | uniform
+  low: 0.03                        # mu range the future is marginalized over
+  high: 0.6
+
+# episodes per object for each data level (the epistemic knob)
+data_levels:
+  large: 100
+  small: 10
+
+# how per-object counts respond to measured variance sigma:
+#   flat     : N = base (literally 100 vs 10). The two axes then INTERACT -- 10 draws
+#              is "small" for a high-variance object but "plenty" for a low-variance
+#              one (epistemic ~ sigma/sqrt(N)). Simplest; matches the raw count idea.
+#   coverage : N = base * (sigma / ref_sigma_cm)**2, capped at [min,max]_count. Makes
+#              epistemic (sigma/sqrt(N)) depend ONLY on the data level, so the variance
+#              and data axes stay independent (clean 2x2 corners) -- at the cost that
+#              low-variance objects get few episodes (they're already well-covered).
+count_mode: flat
+ref_sigma_cm: 8.0
+max_count: 400
+min_count: 4
+
+# probe sweep used only to MEASURE each object's outcome variance
+variance_probe:
+  num_mu: 5            # friction values spanning [hidden_var.low, hidden_var.high]
+  split: median        # median | threshold (only used for objects set to `auto`)
+  threshold_cm: 6.0    # used when split == threshold
+  max_disp_cm: 60.0    # displacement above this = sim blow-up -> clipped + flagged
+
+# The four sets -- one object per cell. Each maps to a LIBERO task whose demo's
+# manipulated object is the one whose friction we sweep. variance_level is PINNED
+# here (informed by the measured sigma ladder: salad_dressing~20, alphabet_soup~10
+# are high; tomato_sauce~7, cream_cheese~0.1 are low) so the demo deterministically
+# fills all four corners. Use `variance_level: auto` to bin by measurement instead.
+objects:
+  # high variance
+  - {name: salad_hi_large,  suite: libero_object, task_id: 2, variance_level: high, data_level: large, color: [0.95, 0.80, 0.10]}  # yellow
+  - {name: soup_hi_small,   suite: libero_object, task_id: 0, variance_level: high, data_level: small, color: [0.90, 0.15, 0.15]}  # red
+  # low variance
+  - {name: cheese_lo_large, suite: libero_object, task_id: 1, variance_level: low,  data_level: large, color: [0.20, 0.40, 1.00]}  # blue
+  - {name: tomato_lo_small, suite: libero_object, task_id: 5, variance_level: low,  data_level: small, color: [0.20, 0.85, 0.30]}  # green

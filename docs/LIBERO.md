@@ -49,6 +49,13 @@ Below is an example for collecting policy roll-out trajectories for a given LIBE
 uv run scripts/run_data_collection.py --config configs/collection/libero_pi05.yaml
 ```
 
+## Uncertainty-quantification data
+
+For sim data with *known ground-truth uncertainty* — counterfactual branch sets
+(shared history, swept hidden physics) and a 2×2 aleatoric × epistemic labelled
+dataset — see [UQ_DATA.md](UQ_DATA.md)
+(`scripts/collect_libero_branch_sets.py`, `scripts/build_uq_dataset.py`).
+
 ## Trajectory Replay
 
 Replays recorded trajectories through a trained world model: each episode's
