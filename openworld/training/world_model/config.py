@@ -100,6 +100,20 @@ class LiberoWMArgs:
     distance_conditioning: bool = False
     use_train_set_for_val: bool = False
     use_weights: bool = False
+    predict_uncertainty: bool = False
+    uncertainty_weight: float = 0.01
+    uq_vis_t_targets: tuple[float, ...] = (0.9, 0.5, 0.1)
+    # With this probability, shift the training anchor forward by a random
+    # delta in [1, num_frames-1]*skip steps so that recent history slots
+    # contain GT frames from the prior chunk's prediction window.  This
+    # simulates the iterative test-time scenario where rolled2 history
+    # includes model-predicted frames.  0.0 = disabled (backward-compatible).
+    p_future_in_history: float = 0.0
+    # With this probability, replace the full history window with the most-recent
+    # history frame repeated for all slots (h6, h6, ..., h6 instead of h1..h6).
+    # Simulates scenarios where only the immediately preceding frame is available.
+    # 0.0 = disabled (backward-compatible).
+    p_single_history: float = 0.0
 
     flow_map_loss_type: str = "lsd"
     psd_sample_mode: str = "uniform"
@@ -113,6 +127,11 @@ class LiberoWMArgs:
     single_bs_mode: bool = False
 
     def __post_init__(self) -> None:
+        if self.p_future_in_history > 0.0 and self.p_single_history > 0.0:
+            raise ValueError(
+                "p_future_in_history and p_single_history are mutually exclusive; "
+                "set at most one of them to a non-zero value."
+            )
         self.output_dir = f"checkpoints/wm_libero/{self.tag}"
         self.wandb_run_name = self.tag
         # Per-camera latent shape after SVD VAE 8x downsample.

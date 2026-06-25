@@ -17,15 +17,19 @@ git lfs install
 
 cd "${ROOT_DIR}"
 
-if [ ! -d "clip-vit-base-patch32" ]; then
+if [ -L "clip-vit-base-patch32" ]; then
+  echo "clip-vit-base-patch32 is a symlink — skipping download."
+elif [ ! -d "clip-vit-base-patch32" ]; then
   git clone https://huggingface.co/openai/clip-vit-base-patch32
+  git -C clip-vit-base-patch32 lfs pull
 fi
-git -C clip-vit-base-patch32 lfs pull
 
-if [ ! -d "stable-video-diffusion-img2vid" ]; then
+if [ -L "stable-video-diffusion-img2vid" ]; then
+  echo "stable-video-diffusion-img2vid is a symlink — skipping download."
+elif [ ! -d "stable-video-diffusion-img2vid" ]; then
   git clone https://huggingface.co/stabilityai/stable-video-diffusion-img2vid
+  git -C stable-video-diffusion-img2vid lfs pull
 fi
-git -C stable-video-diffusion-img2vid lfs pull
 
 PROJ_DIR="$(dirname "${ROOT_DIR}")"
 CKPT_DIR="${PROJ_DIR}/checkpoints"

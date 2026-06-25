@@ -228,7 +228,10 @@ class CrtlWorld(nn.Module):
         self.pipeline = CtrlWorldDiffusionPipeline.from_pretrained(args.svd_model_path)
         # repalce the unet to support frame_level pose condition
         print("replace the unet to support action condition and frame_level pose!")
-        unet = UNetSpatioTemporalConditionModel(distance_conditioning=self.distance_conditioning)
+        unet = UNetSpatioTemporalConditionModel(
+            distance_conditioning=self.distance_conditioning,
+            predict_uncertainty=getattr(args, 'predict_uncertainty', False),
+        )
         unet.load_state_dict(self.pipeline.unet.state_dict(), strict=False)
         
         # from diffusers.models.attention_processor import AttnProcessor2_0
@@ -278,7 +281,7 @@ class CrtlWorld(nn.Module):
         
     
     
-    def _predict_v(self, x_t_full, t, dt_base, action_hidden, added_time_ids, condition_latent, num_history): 
+    def _predict_v(self, x_t_full, t, dt_base, action_hidden, added_time_ids, condition_latent, num_history, return_logvar: bool = False):
         """
         convert EDM diffusion to flow-matching v-prediction
         x_t_full: (B, F, C, H, W)  where F = num_history + num_frames
@@ -320,15 +323,22 @@ class CrtlWorld(nn.Module):
             distance = None
         
         # prediction from edm
-        model_pred = self.unet(input_latents, c_noise, distance=distance, encoder_hidden_states=action_hidden, added_time_ids=added_time_ids,frame_level_cond=self.args.frame_level_cond).sample
-        
+        unet_out = self.unet(input_latents, c_noise, distance=distance, encoder_hidden_states=action_hidden, added_time_ids=added_time_ids, frame_level_cond=self.args.frame_level_cond)
+        model_pred = unet_out.sample
+        logvar_out = unet_out.logvar  # (B, F_total, 1, H, W) or None
+
         # now convert this to v-prediction in flow-map space
-        x1_hat = c_out * model_pred + c_skip * x_t_edm 
-        
+        x1_hat = c_out * model_pred + c_skip * x_t_edm
+
         predicted_noise = (x_t_edm - x1_hat) / sigma
         v_pred = x1_hat - predicted_noise
-        
-        return v_pred[:, num_history:]  # (B, Ff, C, H, W)
+
+        v_pred_future = v_pred[:, num_history:]  # (B, Ff, C, H, W)
+
+        if return_logvar:
+            logvar_future = logvar_out[:, num_history:] if logvar_out is not None else None
+            return v_pred_future, logvar_future
+        return v_pred_future
     
     
     def _flow_map(self, s, t, Is, 
@@ -342,7 +352,7 @@ class CrtlWorld(nn.Module):
             added_time_ids=added_time_ids,
             condition_latent=condition_latent,
             num_history=num_history,
-        )
+        )  # returns tensor (return_logvar=False by default)
         
         X_st = Is[:, num_history:] + phi_st * (t - s).view(-1, 1, 1, 1, 1)
         return X_st
@@ -553,17 +563,28 @@ class CrtlWorld(nn.Module):
         x_t_full[:, :num_history] = noisy_history
     
         # ====== predict & loss ======
-        v_pred_future = self._predict_v(x_t_full, t, dt_base,
-                                        action_hidden=action_hidden,
-                                       added_time_ids=added_time_ids,
-                                       condition_latent=condition_latent,
-                                       num_history=num_history)
+        v_pred_future, logvar_future = self._predict_v(
+            x_t_full, t, dt_base,
+            action_hidden=action_hidden,
+            added_time_ids=added_time_ids,
+            condition_latent=condition_latent,
+            num_history=num_history,
+            return_logvar=True,
+        )
         # breakpoint()
         if self.use_weights:
             log_var = self.log_var_net(t, dt_base)  # (B,)
             weighted_loss = torch.exp(-log_var).view(-1, 1, 1, 1, 1) * ((v_pred_future - v_target_future) ** 2) + log_var.view(-1, 1, 1, 1, 1)
             loss = weighted_loss.mean()
-        else:  
+        else:
             loss = ((v_pred_future - v_target_future) ** 2).mean()
+
+        if logvar_future is not None:
+            # NLL: N(v_pred.detach(), exp(logvar)) — matches patch-forcing DiagonalGaussian.nll()
+            v_diff_sq = (v_pred_future.detach() - v_target_future) ** 2  # (B, F, 4, H, W)
+            nll = 0.5 * (math.log(2.0 * math.pi) + logvar_future + v_diff_sq / logvar_future.exp())
+            uq_loss = nll.mean()
+            loss = loss + self.args.uncertainty_weight * uq_loss
+            return loss, uq_loss.detach()
 
         return loss, torch.tensor(0.0, device=device, dtype=dtype)

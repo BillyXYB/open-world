@@ -27,6 +27,7 @@ class UNetSpatioTemporalConditionOutput(BaseOutput):
     """
 
     sample: torch.Tensor = None
+    logvar: Optional[torch.Tensor] = None  # (B, F, 1, H, W) when predict_uncertainty=True
 
 
 class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
@@ -94,6 +95,7 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         num_attention_heads: Union[int, Tuple[int]] = (5, 10, 20, 20),
         num_frames: int = 25,
         distance_conditioning: bool = False,
+        predict_uncertainty: bool = False,
     ):
         super().__init__()
 
@@ -250,6 +252,13 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         # out
         self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=32, eps=1e-5)
         self.conv_act = nn.SiLU()
+
+        self.predict_uncertainty = predict_uncertainty
+        if predict_uncertainty:
+            self.conv_out_logvar = nn.Conv2d(block_out_channels[0], 1, kernel_size=3, padding=1)
+            # IMPORTANT: zero-init so pretrained behavior is preserved initially
+            nn.init.zeros_(self.conv_out_logvar.weight)
+            nn.init.zeros_(self.conv_out_logvar.bias)
 
         self.conv_out = nn.Conv2d(
             block_out_channels[0],
@@ -534,6 +543,13 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         # 6. post-process
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
+
+        logvar = None
+        if self.predict_uncertainty:
+            logvar = self.conv_out_logvar(sample)  # (B*F, 1, H, W)
+            logvar = logvar.reshape(batch_size, num_frames, *logvar.shape[1:])
+            logvar = logvar.clamp(-30.0, 20.0)
+
         sample = self.conv_out(sample)
 
         # 7. Reshape back to original shape
@@ -542,4 +558,4 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         if not return_dict:
             return (sample,)
 
-        return UNetSpatioTemporalConditionOutput(sample=sample)
+        return UNetSpatioTemporalConditionOutput(sample=sample, logvar=logvar)

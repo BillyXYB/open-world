@@ -271,6 +271,7 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         his_cond_zero=False,
         flow_map_type='shortcut',
         flow_map_loss_type='psd',
+        return_uncertainty: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -482,30 +483,36 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         
         if flow_map_type == 'shortcut':
             # ---- Single-step shortcut solver ----
-            latents = self.short_cut_solver(
+            latents, logvar_steps, vel_steps = self.short_cut_solver(
                 num_inference_steps, latents,
-                image_latents, image_embeddings, 
-                added_time_ids, 
+                image_latents, image_embeddings,
+                added_time_ids,
                 num_his, history, cond_wrist,
-                frame_level_cond, do_classifier_free_guidance
+                frame_level_cond, do_classifier_free_guidance,
+                return_uncertainty=return_uncertainty,
             )
         elif flow_map_type == 'flow_matching':
-            latents = self.euler_solver(
+            latents, logvar_steps, vel_steps = self.euler_solver(
                 num_inference_steps, latents,
-                image_latents, image_embeddings, 
-                added_time_ids, 
+                image_latents, image_embeddings,
+                added_time_ids,
                 num_his, history, cond_wrist,
-                frame_level_cond, do_classifier_free_guidance
+                frame_level_cond, do_classifier_free_guidance,
+                return_uncertainty=return_uncertainty,
             )
         elif flow_map_type == 'flow_map':
-            latents = self.flow_map_solver(
+            latents, logvar_steps, vel_steps = self.flow_map_solver(
                 num_inference_steps, latents,
-                image_latents, image_embeddings, 
-                added_time_ids, 
+                image_latents, image_embeddings,
+                added_time_ids,
                 num_his, history, cond_wrist,
-                frame_level_cond, do_classifier_free_guidance, flow_map_loss_type=flow_map_loss_type
+                frame_level_cond, do_classifier_free_guidance,
+                flow_map_loss_type=flow_map_loss_type,
+                return_uncertainty=return_uncertainty,
             )
-            
+        else:
+            latents, logvar_steps, vel_steps = latents, [], []
+
         if not output_type == "latent":
             # cast back to fp16 if needed
             if needs_upcasting:
@@ -520,11 +527,13 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return frames,latents
+            if return_uncertainty:
+                return frames, latents, logvar_steps, vel_steps
+            return frames, latents
 
         return StableVideoDiffusionPipelineOutput(frames=frames)
-    
-    
+
+
     @torch.no_grad()
     def predict_v(self, t, x_t, 
                   image_latents, image_embeddings, added_time_ids, num_his,
@@ -566,36 +575,42 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         if distance is not None:
             distance = torch.cat([distance] * 2) if do_classifier_free_guidance else distance
         
-        noise_pred = self.unet(
+        unet_out = self.unet(
             latent_model_input,
             c_noise,
             distance=distance,
             encoder_hidden_states=image_embeddings,
             added_time_ids=added_time_ids,
-            return_dict=False,
+            return_dict=True,
             frame_level_cond=frame_level_cond,
-        )[0] # torch.Size([2, 11, 4, 72, 40])
+        )
+        noise_pred = unet_out.sample   # (B_dup, F_all, 4, H, W)
+        logvar_out = unet_out.logvar   # (B_dup, F_all, 1, H, W) or None
 
         if cond_wrist is not None:
             noise_pred = noise_pred[:, :,:,:H, :W] # remove cond_wrist
+            if logvar_out is not None:
+                logvar_out = logvar_out[:, :, :, :H, :W]
         if history is not None:
-            # print('history_shape:',history.shape)
-            # print('noise_pred_shape:',noise_pred.shape)
             noise_pred = noise_pred[:, num_his:, :, :, :] # remove history
+            if logvar_out is not None:
+                logvar_out = logvar_out[:, num_his:, :, :, :]
 
         # perform guidance
         if do_classifier_free_guidance:
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            if logvar_out is not None:
+                _, logvar_out = logvar_out.chunk(2)  # use conditional branch
 
         # compute the previous noisy sample x_t -> x_t-1
         # latents = self.scheduler.step(noise_pred, t, latents).prev_sample
         # now convert this to v-prediction in flow-map space
-        x1_hat = c_out * noise_pred + c_skip * x_t_edm 
+        x1_hat = c_out * noise_pred + c_skip * x_t_edm
         predicted_noise = (x_t_edm - x1_hat) / sigma
         v_pred = x1_hat - predicted_noise
-        
-        return v_pred
+
+        return v_pred, logvar_out
         
     @torch.no_grad()
     def short_cut_solver(self, num_inference_steps, latents
@@ -603,9 +618,12 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                          added_time_ids,
                          num_his=0, history=None, cond_wrist=None,
                          frame_level_cond = False,
-                         do_classifier_free_guidance=False):
+                         do_classifier_free_guidance=False,
+                         return_uncertainty=False):
         device = latents.device
         B = latents.shape[0]
+        logvar_steps = []
+        vel_steps = []
 
         if num_inference_steps <= 1:
             # ---- Single-step shortcut (original behavior) ----
@@ -618,12 +636,15 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
             dt = torch.full((B,), dt, device=device, dtype=torch.int64)
 
             with self.progress_bar(total=1) as progress_bar:
-                v_pred = self.predict_v(t_, latents,
+                v_pred, logvar = self.predict_v(t_, latents,
                                         image_latents, image_embeddings,
                                         added_time_ids, num_his,
                                         history=history, cond_wrist=cond_wrist, distance=dt,
                                         frame_level_cond=frame_level_cond,
                                         do_classifier_free_guidance=do_classifier_free_guidance)
+                if return_uncertainty and logvar is not None:
+                    logvar_steps.append(logvar.detach().cpu())
+                    vel_steps.append(v_pred.detach().cpu())
                 latents = latents + (1 - t_) * v_pred
                 progress_bar.update()
         else:
@@ -642,107 +663,123 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                     t_i = t_grid[i]
                     t_ = t_i.expand(B).view(B, 1, 1, 1, 1).clamp(1/(1+700), 1/(1+0.02))
 
-                    v_pred = self.predict_v(t_, latents,
+                    v_pred, logvar = self.predict_v(t_, latents,
                                             image_latents, image_embeddings,
                                             added_time_ids, num_his,
                                             history=history, cond_wrist=cond_wrist, distance=distance,
                                             frame_level_cond=frame_level_cond,
                                             do_classifier_free_guidance=do_classifier_free_guidance)
+                    if return_uncertainty and logvar is not None:
+                        logvar_steps.append(logvar.detach().cpu())
+                        vel_steps.append(v_pred.detach().cpu())
                     latents = latents + dt_step * v_pred
                     progress_bar.update()
 
-        return latents
+        return latents, logvar_steps, vel_steps
     
     @torch.no_grad()
     def euler_solver(self, num_inference_steps, latents
-                         , image_latents, image_embeddings, 
-                         added_time_ids, 
-                         num_his=0, history=None, cond_wrist=None, 
+                         , image_latents, image_embeddings,
+                         added_time_ids,
+                         num_his=0, history=None, cond_wrist=None,
                          frame_level_cond = False,
-                         do_classifier_free_guidance=False):
+                         do_classifier_free_guidance=False,
+                         return_uncertainty=False):
         B = latents.shape[0]
         device = latents.device
-        
+        logvar_steps = []
+        vel_steps = []
+
         # breakpoint()
         # sample time steps for euler solver
-        
+
         t_grid = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device, dtype=torch.float32)
         # dt is negative
         dt_grid = t_grid[1:] - t_grid[:-1]   # (N,)
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i in range(num_inference_steps):
-                
+
                 t_i = t_grid[i]  # scalar float32 on device
                 dt = dt_grid[i]  # scalar (negative)
 
                 # broadcast time to match your existing interface
                 t_ = t_i.expand(B).view(B, 1, 1, 1, 1).clamp(1/(1+700), 1/(1+0.02))
-                
-                v_pred = self.predict_v(t_, latents, 
-                        image_latents, image_embeddings, 
+
+                v_pred, logvar = self.predict_v(t_, latents,
+                        image_latents, image_embeddings,
                         added_time_ids, num_his,
-                        history=history, cond_wrist=cond_wrist, distance=None, 
-                        frame_level_cond=frame_level_cond, 
+                        history=history, cond_wrist=cond_wrist, distance=None,
+                        frame_level_cond=frame_level_cond,
                         do_classifier_free_guidance=do_classifier_free_guidance)
-                
+
+                if return_uncertainty and logvar is not None:
+                    logvar_steps.append(logvar.detach().cpu())
+                    vel_steps.append(v_pred.detach().cpu())
+
                 latents = latents + v_pred * dt
-                
+
                 progress_bar.update()
-        
-        return latents
+
+        return latents, logvar_steps, vel_steps
     
     
     @torch.no_grad()
     def flow_map_solver(self, num_inference_steps, latents
-                         , image_latents, image_embeddings, 
-                         added_time_ids, 
-                         num_his=0, history=None, cond_wrist=None, 
+                         , image_latents, image_embeddings,
+                         added_time_ids,
+                         num_his=0, history=None, cond_wrist=None,
                          frame_level_cond = False,
                          do_classifier_free_guidance=False,
-                         flow_map_loss_type='psd'):
-        
+                         flow_map_loss_type='psd',
+                         return_uncertainty=False):
+
         device = latents.device
-        
+
         B = latents.shape[0]
-    
+        logvar_steps = []
+        vel_steps = []
+
         # choose shortcut scale (t close to 0 => dt close to 1 => dt_base=0)
-        
+
         t_grid = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device, dtype=torch.float32)
         t_grid = t_grid.clamp(1/(1+700), 1/(1+0.02))
-        # t_grid = t_grid.clamp(1/(1+self.init_noise_sigma), 1/(1+0.02)) 
+        # t_grid = t_grid.clamp(1/(1+self.init_noise_sigma), 1/(1+0.02))
         dt_grid = t_grid[1:] - t_grid[:-1]   # (N,)
-        
+
         if num_inference_steps == 1:
             dt_grid = torch.tensor([1.0 - t_grid[0]], device=device, dtype=torch.float32)
             print("Warning: num_inference_steps=1 for flow_map_solver, set dt to 1-t0")
-        
+
         # t = torch.full((B,), 0, device=device, dtype=torch.float32)
         # t_ = t.view(B, 1, 1, 1, 1).clamp(1/(1+700), 1/(1+0.02))  # (B,1,1,1,1)
         # dt = 1-t_
-        
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i in range(num_inference_steps):
-                t_i = t_grid[i]  
-                dt = dt_grid[i] 
-                 
+                t_i = t_grid[i]
+                dt = dt_grid[i]
+
                 t_ = t_i.expand(B).view(B, 1, 1, 1, 1)
-                dt = dt.expand(B).view(B, 1, 1, 1, 1)
-                if flow_map_loss_type == 'flow_matching':
-                    dt = torch.zeros_like(dt)
-                
-                v_pred = self.predict_v(t_, latents, 
-                                        image_latents, image_embeddings, 
+                dt_step = dt.expand(B).view(B, 1, 1, 1, 1)
+                dt_cond = torch.zeros_like(dt_step) if flow_map_loss_type == 'flow_matching' else dt_step
+
+                v_pred, logvar = self.predict_v(t_, latents,
+                                        image_latents, image_embeddings,
                                         added_time_ids, num_his,
-                                        history=history, cond_wrist=cond_wrist, distance=dt, 
-                                        frame_level_cond=frame_level_cond, 
+                                        history=history, cond_wrist=cond_wrist, distance=dt_cond,
+                                        frame_level_cond=frame_level_cond,
                                         do_classifier_free_guidance=do_classifier_free_guidance)
 
-                latents = latents + v_pred * dt
-            
+                if return_uncertainty and logvar is not None:
+                    logvar_steps.append(logvar.detach().cpu())
+                    vel_steps.append(v_pred.detach().cpu())
+
+                latents = latents + v_pred * dt_step
+
                 progress_bar.update()
-        
-        return latents
+
+        return latents, logvar_steps, vel_steps
     
 class TextStableVideoDiffusionPipeline(StableVideoDiffusionPipeline):
     @torch.no_grad()

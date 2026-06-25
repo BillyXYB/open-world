@@ -123,14 +123,23 @@ class LiberoLatentDataset(Dataset):
     # Sampling
     # ------------------------------------------------------------------
 
-    def _build_frame_ids(self, frame_now: int, frame_len: int) -> tuple[list[int], np.ndarray]:
+    def _build_frame_ids(self, frame_now: int, frame_len: int,
+                         apply_future_in_history: bool = False) -> tuple[list[int], np.ndarray]:
         """Same temporal layout as the DROID loader:
         ``num_history`` frames going back, then ``num_frames`` future frames.
-        Random skip with occasional zeroing for history augmentation."""
+        Random skip with occasional zeroing for history augmentation.
+
+        ``apply_future_in_history`` is pre-computed by the caller as part of
+        a joint mode draw (mutually exclusive with single_history)."""
         skip = random.randint(1, 2)
         skip_his = int(skip * 4)
         if random.random() < 0.15:
             skip_his = 0
+
+        if apply_future_in_history:
+            future_shift = random.randint(1, self.args.num_frames - 1) * skip
+            frame_now = frame_now + future_shift
+            # Existing np.clip(..., 0, frame_len) below handles out-of-bounds.
 
         rgb_id = []
         for i in range(self.args.num_history, 0, -1):
@@ -168,7 +177,16 @@ class LiberoLatentDataset(Dataset):
         joint_len = len(label["observation.state.cartesian_position"]) - 1
         frame_len = int(np.floor(joint_len / self.args.down_sample))
         frame_now = int(frame_ids[0])
-        rgb_id, state_id = self._build_frame_ids(frame_now, frame_len)
+
+        # Joint mode draw: future_in_history and single_history are mutually exclusive.
+        p_fih = getattr(self.args, 'p_future_in_history', 0.0)
+        p_sh = getattr(self.args, 'p_single_history', 0.0)
+        r = random.random()
+        _do_fih = r < p_fih
+        _do_sh = (not _do_fih) and r < p_fih + p_sh
+
+        rgb_id, state_id = self._build_frame_ids(frame_now, frame_len,
+                                                  apply_future_in_history=_do_fih)
 
         # Stack two camera latents vertically along H.
         per_cam_h = self.args.height // 8  # 24 at height=192
@@ -199,6 +217,12 @@ class LiberoLatentDataset(Dataset):
             grip = grip[:, None]
         action = np.concatenate([cart, grip], axis=-1)
         action = self.normalize_bound(action, state_p01, state_p99)
+
+        if _do_sh:
+            num_history = self.args.num_history
+            # Repeat most-recent history frame for all older history slots
+            latent[:num_history - 1] = latent[num_history - 1 : num_history]
+            action[:num_history - 1] = action[num_history - 1 : num_history]
 
         return {
             "text": label["texts"][0] if label.get("texts") else label.get("language_instruction", ""),

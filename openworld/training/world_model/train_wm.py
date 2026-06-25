@@ -69,6 +69,20 @@ def _load_config(config_arg: str | None) -> LiberoWMArgs:
 # ---------------------------------------------------------------------------
 
 
+def _render_uncertainty(logvar: torch.Tensor, H_px: int, W_px: int) -> np.ndarray:
+    """logvar: (T_f, 1, H_lat, W_lat) → (T_f, H_px, W_px, 3) uint8 turbo heatmap."""
+    import torch.nn.functional as F
+    import matplotlib.cm as cm
+
+    var = logvar.exp().float()
+    var_up = F.interpolate(var, size=(H_px, W_px), mode="bilinear", align_corners=False)
+    var_np = var_up[:, 0].cpu().numpy()  # (T_f, H_px, W_px)
+
+    vmin, vmax = float(var_np.min()), float(var_np.max())
+    var_norm = (var_np - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(var_np)
+    return (cm.turbo(var_norm)[..., :3] * 255).astype(np.uint8)
+
+
 def validate_video_generation(
     model,
     val_dataset,
@@ -111,13 +125,15 @@ def validate_video_generation(
             f"({args.num_history + args.num_frames}, {args.action_dim})"
         )
 
+    unwrapped = model.module if accelerator.num_processes > 1 else model
+    use_uq = args.predict_uncertainty and getattr(unwrapped.unet, "predict_uncertainty", False)
+
     with torch.no_grad():
-        unwrapped = model.module if accelerator.num_processes > 1 else model
         action_latent = unwrapped.action_encoder(
             actions, text, unwrapped.tokenizer, unwrapped.text_encoder, args.frame_level_cond
         )
 
-        _, pred_latents = pipeline_cls.__call__(
+        call_result = pipeline_cls.__call__(
             pipeline,
             image=current_latent,
             text=action_latent,
@@ -137,7 +153,13 @@ def validate_video_generation(
             his_cond_zero=args.his_cond_zero,
             flow_map_type=args.flow_map_type,
             flow_map_loss_type=args.flow_map_loss_type,
+            return_uncertainty=use_uq,
         )
+        if use_uq:
+            _, pred_latents, logvar_steps, _ = call_result   # vel_steps unused in validation
+        else:
+            _, pred_latents = call_result
+            logvar_steps = []
 
     # Split the stacked-camera latents back into a per-camera batch dim, decode each.
     pred_latents = einops.rearrange(
@@ -165,6 +187,37 @@ def validate_video_generation(
     pred_arr = np.concatenate([video_gt_arr[:, : args.num_history], pred_arr], axis=1)
     side_by_side = np.concatenate([video_gt_arr, pred_arr], axis=-3)
     grid = np.concatenate([v for v in side_by_side], axis=-2).astype(np.uint8)
+
+    # --- UQ heatmap rows (sampling approach) ---
+    if use_uq and logvar_steps:
+        n_steps = len(logvar_steps)
+        step_t_values = np.linspace(0.0, 1.0, n_steps + 1)[:-1]  # t at each ODE step
+        uq_indices = sorted({
+            int(np.argmin(np.abs(step_t_values - t)))
+            for t in args.uq_vis_t_targets
+        })
+        H_px = video_gt_arr.shape[2]
+        W_px = video_gt_arr.shape[3]
+        T_h = args.num_history
+        for step_idx in uq_indices:
+            lv = logvar_steps[step_idx]  # (B, num_frames, 1, H_lat_total, W_lat)
+            lv_percam = einops.rearrange(
+                lv, "b f 1 (m h) (n w) -> (b m n) f 1 h w", m=args.num_cams, n=1
+            )
+            uq_frames = []
+            for i in range(lv_percam.shape[0]):
+                uq_future = _render_uncertainty(lv_percam[i], H_px, W_px)  # (T_f, H, W, 3)
+                uq_full = np.concatenate([
+                    np.zeros((T_h, H_px, W_px, 3), dtype=np.uint8),
+                    uq_future,
+                ], axis=0)
+                uq_frames.append(uq_full)
+            uq_arr = np.stack(uq_frames, axis=0)  # (B*cams, T_total, H, W, 3)
+            black_slot = np.zeros_like(uq_arr)
+            uq_side_by_side = np.concatenate([black_slot, uq_arr], axis=-3)
+            uq_grid = np.concatenate([v for v in uq_side_by_side], axis=-2)
+            h_sep = np.full((grid.shape[0], 3, grid.shape[2], 3), 200, dtype=np.uint8)
+            grid = np.concatenate([grid, h_sep, uq_grid], axis=1)
 
     out_dir = Path(videos_dir) / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -300,7 +353,7 @@ def main(args: LiberoWMArgs) -> None:
         for _, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
                 with accelerator.autocast():
-                    loss_gen, _ = model(batch)
+                    loss_gen, uq_loss_val = model(batch)
                 avg_loss = accelerator.gather(loss_gen.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
                 accelerator.backward(loss_gen)
@@ -315,6 +368,8 @@ def main(args: LiberoWMArgs) -> None:
                 if global_step % 100 == 0:
                     progress.set_postfix({"loss": train_loss})
                     accelerator.log({"train_loss": train_loss / 100}, step=global_step)
+                    if args.predict_uncertainty:
+                        accelerator.log({"uq_loss": uq_loss_val.item()}, step=global_step)
                     train_loss = 0.0
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.pt")
