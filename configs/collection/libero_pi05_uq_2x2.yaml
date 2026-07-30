@@ -1,0 +1,152 @@
+# 2x2 UQ policy data collection config — all four LIBERO suites.
+#
+# Collects pi0.5 policy roll-outs in friction-varied LIBERO environments,
+# producing a 2x2 benchmark dataset:
+#   (variance_level: high | low) x (data_level: large | small)
+#
+# Variance axis is AUTO-MEASURED via a friction probe (demo replay, no policy):
+#   sigma = std(final object displacement across mu values)
+#   Tasks split at the median sigma: top half -> high, bottom half -> low.
+#   Results cached to <output_root>/variance_probe.json; skipped on re-runs.
+#   Probe videos: <output_root>/probe_videos/<task_name>/mu_<val>.mp4
+#
+# Run probe only (to inspect variance classification before collecting):
+#   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl EGL_DEVICE_ID=0 #     uv run python scripts/run_data_collection_uq.py #       --config configs/collection/libero_pi05_uq_2x2.yaml --probe_only
+#
+# Full collection:
+#   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl EGL_DEVICE_ID=0 #     uv run python scripts/run_data_collection_uq.py #       --config configs/collection/libero_pi05_uq_2x2.yaml
+#
+# Output layout:
+#   <output_root>/<suite>/annotation/<split>/<episode_id>.json
+#   <output_root>/<suite>/raw_videos/{agentview,wrist}/<episode_id>.mp4
+#   <output_root>/<suite>/latent_videos/{agentview,wrist}/<episode_id>.pt
+#   <output_root>/<suite>/{train,val}_sample.json
+#   <output_root>/variance_probe.json
+#   <output_root>/uq_manifest.json
+
+# Path to LIBERO demo HDF5 files (required for variance probe).
+# Download once with:
+#   cd open-world
+#   source scripts/setup.bash
+#   uv run python external/openpi/third_party/libero/benchmark_scripts/download_libero_datasets.py #     --datasets libero_object --download-dir data/libero_datasets
+#   uv run python external/openpi/third_party/libero/benchmark_scripts/download_libero_datasets.py #     --datasets libero_spatial --download-dir data/libero_datasets
+#   uv run python external/openpi/third_party/libero/benchmark_scripts/download_libero_datasets.py #     --datasets libero_goal --download-dir data/libero_datasets
+#   uv run python external/openpi/third_party/libero/benchmark_scripts/download_libero_datasets.py #     --datasets libero_100 --download-dir data/libero_datasets
+# Then set this to the --download-dir used above.
+libero_dataset_path: data/libero_datasets
+
+policy:
+  config_name: pi05_libero
+  checkpoint_path: gs://openpi-assets/checkpoints/pi05_libero
+  repo_path: external/openpi
+  pytorch_device: cuda
+
+# Hidden variable: object sliding friction (mu).
+hidden_var:
+  name: object_sliding_friction
+  distribution: loguniform   # log-uniform over [low, high]
+  low: 0.03
+  high: 0.6
+
+# Variance probe: measures friction sensitivity per task via demo replay.
+# Requires LIBERO demo HDF5 files at libero_dataset_path/<suite>/<task>_demo.hdf5
+variance_probe:
+  num_mu: 5            # friction probe points (geomspace from low to high)
+  split: median        # top half of sigma -> high, bottom half -> low
+  max_disp_cm: 60.0   # clip sim blowups (object ejected != real variance)
+  probe_steps: 80      # max policy steps per mu when using --policy_probe
+
+# Data axis: how many distinct friction environments per task.
+# Each environment gets trajectories_per_env policy rollouts.
+data_levels:
+  large: 80            # 80 distinct mu environments
+  small: 10            # 10 distinct mu environments
+  trajectories_per_env: 1
+
+env:
+  resolution: 256       # native LIBERO offscreen render resolution
+  resize_size: 224      # policy input resolution
+  replan_steps: 5       # execute this many actions per pi0 query
+  num_steps_wait: 10    # let objects settle after reset before recording
+  env_max_reward: 1.0
+  seed: 7
+
+save:
+  output_root: data/libero_uq_2x2
+  write_raw: true                  # write raw_videos/*.mp4
+  encode_latents: true             # write latent_videos/*.pt (needs svd_path)
+  svd_path: external/stable-video-diffusion-img2vid
+  device: cuda
+  down_sample: 1                   # 1 => keep native 20 Hz
+  raw_fps: 20
+  val_fraction: 0.1                # 10% of episodes routed to val split
+  num_history: 6                   # sample-index margins (match WM config)
+  num_frames: 5
+
+# Task assignments across 4 LIBERO suites.
+#
+# variance_level: omit -> auto-assigned by probe median split.
+#                 Set explicitly (high/low) to override.
+#
+# data_level: large -> N_large friction environments; small -> N_small.
+#             Assigned evenly (alternating) so variance and data axes stay independent.
+#
+# object_body: MuJoCo body name of the manipulated object.
+#   libero_object:  {object}_1_main (e.g. alphabet_soup_1_main)
+#   libero_spatial: akita_black_bowl_1_main (target bowl in all tasks)
+#   libero_goal:    per-task (documented); tasks 0 & 7 skipped (drawer/button)
+#   libero_10:      null -> auto-detected via demo replay displacement
+#
+# Total: 10 (object) + 10 (spatial) + 8 (goal) + 10 (10) = 38 tasks
+#        19 large + 19 small; variance split by probe median.
+
+objects:
+  # ── libero_object: 10 tasks, each picks up one grocery item ──────────────
+  - {name: obj_soup,    suite: libero_object, task_id: 0, data_level: large, object_body: alphabet_soup_1_main}
+  - {name: obj_cheese,  suite: libero_object, task_id: 1, data_level: small, object_body: cream_cheese_1_main}
+  - {name: obj_salad,   suite: libero_object, task_id: 2, data_level: large, object_body: salad_dressing_1_main}
+  - {name: obj_bbq,     suite: libero_object, task_id: 3, data_level: small, object_body: bbq_sauce_1_main}
+  - {name: obj_ketchup, suite: libero_object, task_id: 4, data_level: large, object_body: ketchup_1_main}
+  - {name: obj_tomato,  suite: libero_object, task_id: 5, data_level: small, object_body: tomato_sauce_1_main}
+  - {name: obj_butter,  suite: libero_object, task_id: 6, data_level: large, object_body: butter_1_main}
+  - {name: obj_milk,    suite: libero_object, task_id: 7, data_level: small, object_body: milk_1_main}
+  - {name: obj_pudding, suite: libero_object, task_id: 8, data_level: large, object_body: chocolate_pudding_1_main}
+  - {name: obj_orange,  suite: libero_object, task_id: 9, data_level: small, object_body: orange_juice_1_main}
+
+  # ── libero_spatial: 10 tasks, all pick up a black bowl ───────────────────
+  # All tasks use akita_black_bowl_1_main as the target (two bowls in scene;
+  # the target is always _1_main as confirmed by demo displacement).
+  - {name: spa_t0, suite: libero_spatial, task_id: 0, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: spa_t1, suite: libero_spatial, task_id: 1, data_level: small, object_body: akita_black_bowl_1_main}
+  - {name: spa_t2, suite: libero_spatial, task_id: 2, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: spa_t3, suite: libero_spatial, task_id: 3, data_level: small, object_body: akita_black_bowl_1_main}
+  - {name: spa_t4, suite: libero_spatial, task_id: 4, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: spa_t5, suite: libero_spatial, task_id: 5, data_level: small, object_body: akita_black_bowl_1_main}
+  - {name: spa_t6, suite: libero_spatial, task_id: 6, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: spa_t7, suite: libero_spatial, task_id: 7, data_level: small, object_body: akita_black_bowl_1_main}
+  - {name: spa_t8, suite: libero_spatial, task_id: 8, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: spa_t9, suite: libero_spatial, task_id: 9, data_level: small, object_body: akita_black_bowl_1_main}
+
+  # ── libero_goal: 8 usable tasks (skip task 0=drawer, task 7=button) ──────
+  - {name: gol_t1, suite: libero_goal, task_id: 1, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: gol_t2, suite: libero_goal, task_id: 2, data_level: small, object_body: wine_bottle_1_main}
+  - {name: gol_t3, suite: libero_goal, task_id: 3, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: gol_t4, suite: libero_goal, task_id: 4, data_level: small, object_body: akita_black_bowl_1_main}
+  - {name: gol_t5, suite: libero_goal, task_id: 5, data_level: large, object_body: plate_1_main}
+  - {name: gol_t6, suite: libero_goal, task_id: 6, data_level: small, object_body: cream_cheese_1_main}
+  - {name: gol_t8, suite: libero_goal, task_id: 8, data_level: large, object_body: akita_black_bowl_1_main}
+  - {name: gol_t9, suite: libero_goal, task_id: 9, data_level: small, object_body: wine_bottle_1_main}
+
+  # ── libero_10: 10 tasks across multiple scenes ───────────────────────────
+  # object_body is auto-detected via demo-replay displacement when null.
+  # Run --probe_only to confirm detections before full collection.
+  - {name: l10_t0, suite: libero_10, task_id: 0, data_level: large, object_body: null}
+  - {name: l10_t1, suite: libero_10, task_id: 1, data_level: small, object_body: null}
+  - {name: l10_t2, suite: libero_10, task_id: 2, data_level: large, object_body: null}
+  - {name: l10_t3, suite: libero_10, task_id: 3, data_level: small, object_body: null}
+  - {name: l10_t4, suite: libero_10, task_id: 4, data_level: large, object_body: null}
+  - {name: l10_t5, suite: libero_10, task_id: 5, data_level: small, object_body: null}
+  - {name: l10_t6, suite: libero_10, task_id: 6, data_level: large, object_body: null}
+  - {name: l10_t7, suite: libero_10, task_id: 7, data_level: small, object_body: null}
+  - {name: l10_t8, suite: libero_10, task_id: 8, data_level: large, object_body: null}
+  - {name: l10_t9, suite: libero_10, task_id: 9, data_level: small, object_body: null}

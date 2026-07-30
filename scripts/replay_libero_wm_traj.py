@@ -124,6 +124,7 @@ def replay_episode(
     num_inference_steps: int, skip: int, max_chunks: int | None,
     use_uq: bool = False,
     uq_epi_mode: str = "none",      # "none" | "zero_history" | "flat_history" | "iterative"
+    on_chunk=None,                  # Callable[[int,int,list,list,list,list,list],None] | None
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[torch.Tensor],
            torch.Tensor | None, list[torch.Tensor]]:
     """Closed-loop rollout.
@@ -267,6 +268,33 @@ def replay_episode(
                         ]
                     if uq_epi_mode == "iterative" and rolled2 is not None:
                         rolled2[t_native] = pred[k].clone()  # use Pass-1 predictions
+
+        # Per-chunk callback: stream UQ metrics for this chunk's predicted frames
+        if on_chunk is not None and logvar_steps:
+            chunk_frame_indices = [
+                rgb_id[num_history + k] for k in range(num_frames)
+                if rgb_id[num_history + k] < T
+            ]
+            if chunk_frame_indices:
+                n_ode = len(logvar_steps)
+                chunk_lv = [
+                    torch.stack([frame_logvar[t][s] for t in chunk_frame_indices], 0)
+                    for s in range(n_ode)
+                ]
+                chunk_vel = [
+                    torch.stack([frame_vel[t][s] for t in chunk_frame_indices], 0)
+                    for s in range(n_ode)
+                ] if vel_steps else []
+                chunk_epi_lv = [
+                    torch.stack([epi_frame_logvar[t][s] for t in chunk_frame_indices], 0)
+                    for s in range(n_ode)
+                ] if epi_frame_logvar else []
+                chunk_epi_vel = [
+                    torch.stack([epi_frame_vel[t][s] for t in chunk_frame_indices], 0)
+                    for s in range(n_ode)
+                ] if epi_frame_vel else []
+                on_chunk(chunk_idx, frame_now, chunk_frame_indices,
+                         chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel)
         chunk_idx += 1
 
     if chunk_idx == 0:
@@ -550,6 +578,10 @@ def main() -> None:
                         "'flat_history'=repeat current frame as history, "
                         "'single_history'=repeat most-recent history frame for all slots, "
                         "'iterative'=self-consistency (pass 2 uses pass-1 predictions as history).")
+    p.add_argument("--manifest", default=None,
+                   help="Path to test_manifest_by_cell.json for cell-balanced episode selection.")
+    p.add_argument("--max_episodes_per_cell", type=int, default=0,
+                   help="Cap episodes per cell from manifest (0 = all).")
     a = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -583,122 +615,209 @@ def main() -> None:
         print("[replay] WARNING: --predict_uncertainty set but checkpoint has no UQ head; disabling.")
 
     max_chunks = a.max_chunks if a.max_chunks > 0 else None
+
+    # Pre-load action normalization stats for all suites
+    suite_stats: dict[str, tuple] = {
+        suite: _load_stat(a.stat_root, suite) for suite in suites
+    }
+
+    # Build flat episode list as (suite, ep_id, cell|None), optionally from manifest
+    if a.manifest:
+        from collections import deque
+        _CELLS = ["high_var/large_data", "high_var/small_data",
+                  "low_var/large_data",  "low_var/small_data"]
+        _manifest = json.loads(Path(a.manifest).read_text())
+        _queues: dict = {}
+        for _cell in _CELLS:
+            _eps = _manifest["cells"].get(_cell, [])
+            if a.max_episodes_per_cell > 0:
+                _eps = _eps[:a.max_episodes_per_cell]
+            _queues[_cell] = deque(_eps)
+        episode_list: list[tuple] = []
+        while any(_queues.values()):
+            for _cell in _CELLS:
+                if _queues[_cell]:
+                    _ep = _queues[_cell].popleft()
+                    episode_list.append((_ep["suite"], _ep["episode_id"], _cell))
+        print(f"[replay] manifest: {len(episode_list)} episodes across {len(_CELLS)} cells")
+    else:
+        episode_list = []
+        for suite in suites:
+            ep_ids = ([a.episode_id] if a.episode_id
+                      else list_episode_ids(a.data_root, suite, a.split))
+            if a.num_episodes > 0:
+                ep_ids = ep_ids[:a.num_episodes]
+            for ep_id in ep_ids:
+                episode_list.append((suite, ep_id, None))
+
+    # Open streaming JSONL for per-chunk metrics (append mode so resuming works)
+    out_root.mkdir(parents=True, exist_ok=True)
+    jsonl_path = out_root / "chunk_metrics.jsonl"
+    _jsonl_fh = open(jsonl_path, "a")
+
+    def _make_on_chunk(suite: str, ep_id: str, cell):
+        """Return per-chunk callback; streams one JSONL record per autoregressive chunk."""
+        def _on_chunk(chunk_idx: int, frame_now: int, chunk_frame_indices: list,
+                      chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel) -> None:
+            agg = compute_uq_metrics(chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel)
+            uq_t: dict = {}
+            if chunk_lv and args.uq_vis_t_targets:
+                n_ode = len(chunk_lv)
+                _t_arr = np.linspace(0.0, 1.0, n_ode + 1)[:-1]
+                _idxs = sorted({int(np.argmin(np.abs(_t_arr - t)))
+                                 for t in args.uq_vis_t_targets})
+                for si in _idxs:
+                    t_tag = f"t{float(_t_arr[si]):.1f}"
+                    t_met = compute_uq_metrics(
+                        [chunk_lv[si]],
+                        [chunk_vel[si]]     if chunk_vel     else [],
+                        [chunk_epi_lv[si]]  if chunk_epi_lv  else [],
+                        [chunk_epi_vel[si]] if chunk_epi_vel else [],
+                    )
+                    for k, v in t_met.items():
+                        uq_t[f"{t_tag}_{k}"] = v
+            record = {
+                "suite": suite, "episode": ep_id, "uncertainty_cell": cell,
+                "chunk_idx": chunk_idx, "frame_now": frame_now,
+                **agg, **uq_t,
+            }
+            _jsonl_fh.write(json.dumps(record) + "\n")
+            _jsonl_fh.flush()
+        return _on_chunk
+
     summary = []
-    for suite in suites:
-        ep_ids = [a.episode_id] if a.episode_id else list_episode_ids(a.data_root, suite, a.split)
-        if a.num_episodes > 0:
-            ep_ids = ep_ids[: a.num_episodes]
-        p01, p99 = _load_stat(a.stat_root, suite)
+    for suite, ep_id, cell in episode_list:
+        p01, p99 = suite_stats[suite]
+        latent_gt, action_native, text, native_fps = load_full_episode(
+            a.data_root, suite, ep_id, args, a.split)
 
-        for ep_id in ep_ids:
-            latent_gt, action_native, text, native_fps = load_full_episode(
-                a.data_root, suite, ep_id, args, a.split)
+        # Stride 20 Hz -> target_hz (5 Hz) so spacing matches how the WM was trained.
+        stride = max(1, round(native_fps / a.target_hz))
+        latent5 = latent_gt[::stride]
+        action5 = normalize_actions(action_native[::stride], p01, p99)
+        print(f"[replay] {suite}/{ep_id}: {latent_gt.shape[0]}@{native_fps}Hz "
+              f"-> {latent5.shape[0]}@{a.target_hz}Hz  {text!r}")
 
-            # Stride 20 Hz -> target_hz (5 Hz) so spacing matches how the WM was trained.
-            stride = max(1, round(native_fps / a.target_hz))
-            latent5 = latent_gt[::stride]
-            action5 = normalize_actions(action_native[::stride], p01, p99)
-            print(f"[replay] {suite}/{ep_id}: {latent_gt.shape[0]}@{native_fps}Hz "
-                  f"-> {latent5.shape[0]}@{a.target_hz}Hz  {text!r}")
+        try:
+            (gt_stack, pred_stack, idxs,
+             logvar_by_step, vel_by_step,
+             epi_pred_stack, epi_logvar_by_step, epi_vel_by_step) = replay_episode(
+                model, pipeline, pipeline_cls, args, latent5, action5, text, device,
+                a.num_inference_steps, a.skip, max_chunks,
+                use_uq=use_uq, uq_epi_mode=a.uq_epi_mode,
+                on_chunk=_make_on_chunk(suite, ep_id, cell))
+        except RuntimeError as e:
+            print(f"[replay]   skipped: {e}")
+            continue
 
-            try:
-                (gt_stack, pred_stack, idxs,
-                 logvar_by_step, vel_by_step,
-                 epi_pred_stack, epi_logvar_by_step, epi_vel_by_step) = replay_episode(
-                    model, pipeline, pipeline_cls, args, latent5, action5, text, device,
-                    a.num_inference_steps, a.skip, max_chunks,
-                    use_uq=use_uq, uq_epi_mode=a.uq_epi_mode)
-            except RuntimeError as e:
-                print(f"[replay]   skipped: {e}")
-                continue
+        gt_vid = decode_per_cam(gt_stack, pipeline, args)
+        pred_vid = decode_per_cam(pred_stack, pipeline, args)
 
-            gt_vid = decode_per_cam(gt_stack, pipeline, args)
-            pred_vid = decode_per_cam(pred_stack, pipeline, args)
-
-            # ODE step indices closest to each t-target
-            uq_indices: list[int] = []
-            ref_steps = logvar_by_step or epi_logvar_by_step
-            if use_uq and ref_steps:
-                n_ode = len(ref_steps)
-                step_t_values = np.linspace(0.0, 1.0, n_ode + 1)[:-1]
-                uq_indices = sorted({
-                    int(np.argmin(np.abs(step_t_values - t)))
-                    for t in args.uq_vis_t_targets
-                })
-
-            has_epi = a.uq_epi_mode != "none" and epi_pred_stack is not None
-            has_vel = bool(vel_by_step and epi_vel_by_step)
-            use_compare = (use_uq and logvar_by_step) or has_epi
-
-            # Aggregate UQ tensors across all ODE steps for the extra summary row/metrics.
-            agg_logvar     = torch.stack(logvar_by_step,     0).mean(0) if logvar_by_step     else None
-            agg_vel        = torch.stack(vel_by_step,        0).mean(0) if vel_by_step        else None
-            agg_epi_logvar = torch.stack(epi_logvar_by_step, 0).mean(0) if epi_logvar_by_step else None
-            agg_epi_vel    = torch.stack(epi_vel_by_step,    0).mean(0) if epi_vel_by_step    else None
-
-            if use_compare:
-                # Each t-target is one horizontal row; rows are stacked vertically.
-                # Row layout: GT | Pred | alea [| ltv | epi_var | pdf_diff | kl]
-                rows = []
-                for step_idx in uq_indices:
-                    row_cols = [gt_vid, pred_vid,
-                                _render_uq_video(logvar_by_step[step_idx], args)]
-                    if has_epi and use_uq and has_vel and epi_logvar_by_step:
-                        row_cols += [
-                            _render_vel_ltv_video(
-                                vel_by_step[step_idx], epi_vel_by_step[step_idx], args),
-                            _render_epi_var_video(
-                                logvar_by_step[step_idx], epi_logvar_by_step[step_idx], args),
-                            _render_pdf_diff_video(
-                                logvar_by_step[step_idx], epi_logvar_by_step[step_idx], args),
-                            _render_kl_video(
-                                vel_by_step[step_idx], logvar_by_step[step_idx],
-                                epi_vel_by_step[step_idx], epi_logvar_by_step[step_idx], args),
-                        ]
-                    rows.append(np.concatenate(row_cols, axis=2))
-
-                # Extra row: aggregated (mean across all ODE steps)
-                if agg_logvar is not None:
-                    agg_cols = [gt_vid, pred_vid, _render_uq_video(agg_logvar, args)]
-                    if (has_epi and use_uq and agg_vel is not None
-                            and agg_epi_logvar is not None and agg_epi_vel is not None):
-                        agg_cols += [
-                            _render_vel_ltv_video(agg_vel, agg_epi_vel, args),
-                            _render_epi_var_video(agg_logvar, agg_epi_logvar, args),
-                            _render_pdf_diff_video(agg_logvar, agg_epi_logvar, args),
-                            _render_kl_video(agg_vel, agg_logvar, agg_epi_vel, agg_epi_logvar, args),
-                        ]
-                    rows.append(np.concatenate(agg_cols, axis=2))
-
-                if rows:
-                    T_vid = rows[0].shape[0]
-                    h_sep = np.full((T_vid, 3, rows[0].shape[2], 3), 200, dtype=np.uint8)
-                    composite = rows[0]
-                    for row in rows[1:]:
-                        composite = np.concatenate([composite, h_sep, row], axis=1)
-                    write_video(composite, out_root / "compare" / f"{suite}_{ep_id}.mp4", a.video_fps)
-                else:
-                    # no uq_indices (e.g. uq disabled, epi-only mode)
-                    composite = np.concatenate([gt_vid, pred_vid], axis=2)
-                    write_video(composite, out_root / "compare" / f"{suite}_{ep_id}.mp4", a.video_fps)
-            else:
-                write_video(gt_vid, out_root / "gt" / f"{suite}_{ep_id}.mp4", a.video_fps)
-                write_video(pred_vid, out_root / "pred" / f"{suite}_{ep_id}.mp4", a.video_fps)
-
-            latent_mse = float(((gt_stack - pred_stack) ** 2).mean())
-            pixel_mse = float(np.mean((gt_vid / 255.0 - pred_vid / 255.0) ** 2))
-            psnr = float(10 * np.log10(1.0 / max(pixel_mse, 1e-12)))
-            uq_metrics = compute_uq_metrics(
-                logvar_by_step, vel_by_step, epi_logvar_by_step, epi_vel_by_step)
-            uq_str = "  ".join(f"{k}={v:.4f}" for k, v in uq_metrics.items())
-            print(f"[replay]   {len(idxs)} frames  latent-MSE={latent_mse:.4f}  PSNR={psnr:.2f}dB"
-                  + (f"  {uq_str}" if uq_str else ""))
-            summary.append({
-                "suite": suite, "episode": ep_id, "frames": len(idxs),
-                "latent_mse": latent_mse, "pixel_mse": pixel_mse, "psnr_db": psnr, "text": text,
-                **uq_metrics,
+        # ODE step indices closest to each t-target
+        uq_indices: list[int] = []
+        ref_steps = logvar_by_step or epi_logvar_by_step
+        if use_uq and ref_steps:
+            n_ode = len(ref_steps)
+            step_t_values = np.linspace(0.0, 1.0, n_ode + 1)[:-1]
+            uq_indices = sorted({
+                int(np.argmin(np.abs(step_t_values - t)))
+                for t in args.uq_vis_t_targets
             })
 
+        has_epi = a.uq_epi_mode != "none" and epi_pred_stack is not None
+        has_vel = bool(vel_by_step and epi_vel_by_step)
+        use_compare = (use_uq and logvar_by_step) or has_epi
+
+        # Aggregate UQ tensors across all ODE steps for the extra summary row/metrics.
+        agg_logvar     = torch.stack(logvar_by_step,     0).mean(0) if logvar_by_step     else None
+        agg_vel        = torch.stack(vel_by_step,        0).mean(0) if vel_by_step        else None
+        agg_epi_logvar = torch.stack(epi_logvar_by_step, 0).mean(0) if epi_logvar_by_step else None
+        agg_epi_vel    = torch.stack(epi_vel_by_step,    0).mean(0) if epi_vel_by_step    else None
+
+        if use_compare:
+            # Each t-target is one horizontal row; rows are stacked vertically.
+            # Row layout: GT | Pred | alea [| ltv | epi_var | pdf_diff | kl]
+            rows = []
+            for step_idx in uq_indices:
+                row_cols = [gt_vid, pred_vid,
+                            _render_uq_video(logvar_by_step[step_idx], args)]
+                if has_epi and use_uq and has_vel and epi_logvar_by_step:
+                    row_cols += [
+                        _render_vel_ltv_video(
+                            vel_by_step[step_idx], epi_vel_by_step[step_idx], args),
+                        _render_epi_var_video(
+                            logvar_by_step[step_idx], epi_logvar_by_step[step_idx], args),
+                        _render_pdf_diff_video(
+                            logvar_by_step[step_idx], epi_logvar_by_step[step_idx], args),
+                        _render_kl_video(
+                            vel_by_step[step_idx], logvar_by_step[step_idx],
+                            epi_vel_by_step[step_idx], epi_logvar_by_step[step_idx], args),
+                    ]
+                rows.append(np.concatenate(row_cols, axis=2))
+
+            # Extra row: aggregated (mean across all ODE steps)
+            if agg_logvar is not None:
+                agg_cols = [gt_vid, pred_vid, _render_uq_video(agg_logvar, args)]
+                if (has_epi and use_uq and agg_vel is not None
+                        and agg_epi_logvar is not None and agg_epi_vel is not None):
+                    agg_cols += [
+                        _render_vel_ltv_video(agg_vel, agg_epi_vel, args),
+                        _render_epi_var_video(agg_logvar, agg_epi_logvar, args),
+                        _render_pdf_diff_video(agg_logvar, agg_epi_logvar, args),
+                        _render_kl_video(agg_vel, agg_logvar, agg_epi_vel, agg_epi_logvar, args),
+                    ]
+                rows.append(np.concatenate(agg_cols, axis=2))
+
+            if rows:
+                T_vid = rows[0].shape[0]
+                h_sep = np.full((T_vid, 3, rows[0].shape[2], 3), 200, dtype=np.uint8)
+                composite = rows[0]
+                for row in rows[1:]:
+                    composite = np.concatenate([composite, h_sep, row], axis=1)
+                write_video(composite, out_root / "compare" / f"{suite}_{ep_id}.mp4", a.video_fps)
+            else:
+                # no uq_indices (e.g. uq disabled, epi-only mode)
+                composite = np.concatenate([gt_vid, pred_vid], axis=2)
+                write_video(composite, out_root / "compare" / f"{suite}_{ep_id}.mp4", a.video_fps)
+        else:
+            write_video(gt_vid, out_root / "gt" / f"{suite}_{ep_id}.mp4", a.video_fps)
+            write_video(pred_vid, out_root / "pred" / f"{suite}_{ep_id}.mp4", a.video_fps)
+
+        latent_mse = float(((gt_stack - pred_stack) ** 2).mean())
+        pixel_mse = float(np.mean((gt_vid / 255.0 - pred_vid / 255.0) ** 2))
+        psnr = float(10 * np.log10(1.0 / max(pixel_mse, 1e-12)))
+        uq_metrics = compute_uq_metrics(
+            logvar_by_step, vel_by_step, epi_logvar_by_step, epi_vel_by_step)
+
+        # Per-t-target UQ metrics: one compute_uq_metrics call per ODE step
+        # index closest to each uq_vis_t_targets value (same indices used for vis).
+        uq_t_metrics: dict[str, float] = {}
+        if uq_indices and logvar_by_step:
+            n_ode = len(logvar_by_step)
+            step_t_vals = np.linspace(0.0, 1.0, n_ode + 1)[:-1]
+            for step_idx in uq_indices:
+                t_val = float(step_t_vals[step_idx])
+                t_tag = f"t{t_val:.1f}"
+                t_met = compute_uq_metrics(
+                    [logvar_by_step[step_idx]],
+                    [vel_by_step[step_idx]]         if vel_by_step         else [],
+                    [epi_logvar_by_step[step_idx]]  if epi_logvar_by_step  else [],
+                    [epi_vel_by_step[step_idx]]     if epi_vel_by_step     else [],
+                )
+                for k, v in t_met.items():
+                    uq_t_metrics[f"{t_tag}_{k}"] = v
+
+        uq_str = "  ".join(f"{k}={v:.4f}" for k, v in uq_metrics.items())
+        print(f"[replay]   {len(idxs)} frames  latent-MSE={latent_mse:.4f}  PSNR={psnr:.2f}dB"
+              + (f"  {uq_str}" if uq_str else ""))
+        summary.append({
+            "suite": suite, "episode": ep_id, "uncertainty_cell": cell, "frames": len(idxs),
+            "latent_mse": latent_mse, "pixel_mse": pixel_mse, "psnr_db": psnr, "text": text,
+            **uq_metrics,      # aggregated (mean over all ODE steps)
+            **uq_t_metrics,    # per-t: t0.9_mean_aleatoric_var, t0.5_mean_epi_ltv, ...
+        })
+
+    _jsonl_fh.close()
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / "replay_summary.json").write_text(json.dumps(summary, indent=2))
     use_compare_any = use_uq or a.uq_epi_mode != "none"

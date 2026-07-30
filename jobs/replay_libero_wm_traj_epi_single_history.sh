@@ -24,14 +24,23 @@ source scripts/setup.bash
 # Disable online W&B
 export WANDB_MODE=offline
 
+# ===== CHECKPOINT (auto-select latest from future-hist run) =====
+CKPT_DIR="checkpoints/wm_libero/libero_flow_matching_uq_single_hist_v0"
+CKPT=$(ls -t "${CKPT_DIR}"/checkpoint-*.pt 2>/dev/null | head -1)
+if [ -z "${CKPT}" ]; then
+    echo "ERROR: no checkpoint found in ${CKPT_DIR}"
+    exit 1
+fi
+echo "Using checkpoint: ${CKPT}"
+
 # ===== REPLAY (epistemic UQ: single_history) =====
 # Pass 1: true rolled history.
 # Pass 2: all history slots replaced with the most-recent history frame repeated num_history times.
 # Epistemic columns: EpiLTV (always) + EpiVar per t-target (if UQ head present).
 uv run scripts/replay_libero_wm_traj.py \
-    --checkpoint /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/checkpoints/wm_libero/libero_flow_matching_uq_single_hist_v0/checkpoint-76000.pt \
+    --checkpoint "${CKPT}" \
     --data_root data/libero_collected \
-    --output_dir checkpoints/wm_libero/libero_wm_uq_single_hist/replay_epi_single_history \
+    --output_dir "${CKPT_DIR}/replay_epi_single_history" \
     --stat_root /scratch/gpfs/AM43/yy4041/open-world/data/wm_training/libero_processed_5hz/ \
     --predict_uncertainty \
     --uq_vis_t_targets 0.9 0.5 0.1 \

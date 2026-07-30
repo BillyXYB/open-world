@@ -30,3 +30,4 @@ tests/
 tmp_*
 slurm_outputs/
 CLAUDE.md
+results/*
