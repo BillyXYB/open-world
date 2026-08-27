@@ -1,0 +1,51 @@
+# Standalone smoke-test config for the candidate-comparison visualization
+# feature (active_uq.viz) -- kept separate from libero_pi05_active_uq.yaml so
+# it doesn't interfere with real collection settings being tuned there.
+#
+# Run with:
+#   uv run scripts/run_data_collection_active_uq.py \
+#       --config configs/collection/libero_pi05_active_uq_viz_smoke_test.yaml
+
+policy:
+  config_name: pi05_libero
+  checkpoint_path: gs://openpi-assets/checkpoints/pi05_libero
+  repo_path: external/openpi
+  pytorch_device: cuda
+
+collection:
+  task_suites: [libero_spatial]
+  task_ids: null # [0]
+  trajectories_per_task: 1
+  prompt_override: null
+
+env:
+  resolution: 256
+  resize_size: 224
+  replan_steps: 4
+  num_steps_wait: 10
+  env_max_reward: 1.0
+  seed: 7
+
+save:
+  output_root: data/active_uq_viz_smoke_test
+  write_raw: true
+  svd_path: external/stable-video-diffusion-img2vid
+  device: cuda
+  down_sample: 1
+  raw_fps: 20
+  val_fraction: 0.0
+  num_history: 6
+  num_frames: 5
+
+active_uq:
+  num_candidates: 4
+  wm_checkpoint: checkpoints/wm_libero/libero_wm_uq_2x2_policy_probe_future_hist_v0/checkpoint-200000.pt
+  stat_root: data/libero_uq_2x2_policy_probe
+  clip_model_path: external/clip-vit-base-patch32
+  num_inference_steps: 15
+  uq_metric: mean_epi_ltv
+  viz:
+    enabled: true
+    every_n_decisions: 4
+    max_decisions_per_episode: null   # null = no cap; was 3 for a fast smoke test
+    fps: 3

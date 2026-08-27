@@ -206,6 +206,40 @@ class LiberoLatentDataset(Dataset):
             cam_latent = self._load_latent_video(video_path, rgb_id)
             latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
 
+        # False-future augmentation: with probability p_false_future, load a
+        # mismatched future clip from a different (randomly chosen) episode.
+        # Spliced into the history-future-overlap context in CrtlWorld.forward()
+        # in place of the true peeked future -- the diffusion target stays the
+        # real continuation of THIS episode, so the model must learn to judge
+        # whether the peeked content is actually plausible instead of just
+        # trusting "peek == answer". See config.py's p_false_future docstring.
+        p_ff = getattr(self.args, 'p_false_future', 0.0)
+        use_false_future = p_ff > 0.0 and random.random() < p_ff
+        false_future_latent = torch.zeros(
+            (self.args.num_frames - 1, 4, total_h, latent_w), dtype=torch.float32
+        )
+        if use_false_future:
+            j = index
+            for _ in range(5):  # avoid accidentally picking the same episode
+                j = random.randrange(len(samples))
+                distractor = samples[j]
+                if distractor["episode_id"] != sample["episode_id"]:
+                    break
+            distractor = samples[j]
+            distractor_dir = dataset_path[j]
+            distractor_ann = os.path.join(
+                distractor_dir, self.args.annotation_name, self.mode, f"{distractor['episode_id']}.json"
+            )
+            with open(distractor_ann) as f:
+                distractor_label = json.load(f)
+            distractor_frame_now = int(distractor["frame_ids"][0])
+            distractor_rgb_id = [distractor_frame_now + i for i in range(1, self.args.num_frames)]
+            distractor_cam_specs = distractor_label.get("latent_videos", [])
+            for cam_idx in range(self.args.num_cams):
+                video_path = os.path.join(distractor_dir, distractor_cam_specs[cam_idx]["latent_video_path"])
+                cam_latent = self._load_latent_video(video_path, distractor_rgb_id)
+                false_future_latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
+
         # Action conditioning: cartesian + gripper.
         cart = np.asarray(label["observation.state.cartesian_position"], dtype=np.float32)[
             np.clip(state_id, 0, len(label["observation.state.cartesian_position"]) - 1)
@@ -228,6 +262,8 @@ class LiberoLatentDataset(Dataset):
             "text": label["texts"][0] if label.get("texts") else label.get("language_instruction", ""),
             "latent": latent.float(),
             "action": torch.tensor(action, dtype=torch.float32),
+            "false_future_latent": false_future_latent,
+            "use_false_future": torch.tensor(use_false_future),
         }
 
 

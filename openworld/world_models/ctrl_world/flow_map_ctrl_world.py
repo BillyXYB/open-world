@@ -5,6 +5,7 @@ from .flow_map_unet_spatio_temporal_condition import UNetSpatioTemporalCondition
 from .flow_map_utils import create_targets_shortcut, create_targets, create_targets_flow_matching, create_targets_lsd, create_targets_psd, create_targets_one_step
 
 import numpy as np
+import random
 import torch
 import torch.nn as nn
 import einops
@@ -407,6 +408,50 @@ class CrtlWorld(nn.Module):
 
         num_history = self.args.num_history
         latents = latents.to(device) #[B, num_history + num_frames]
+        action = batch['action'].to(device)  # (B,f,7) -- moved up from below so the overlap splice can extend it too
+
+        # history-future-overlap augmentation: with probability p_history_future_overlap
+        # (drawn once for the whole batch/step, not per-sample), grow the history window
+        # by k in [1, num_frames-1] extra slots holding frame_now+1..frame_now+k -- the
+        # SAME future frames that also appear later in the noised target block. `current`
+        # (the frame at the new num_history index) is unchanged: the original
+        # latents[:, num_history:]/action[:, num_history:] block is preserved verbatim and
+        # simply relocated to start at the new, larger num_history offset.
+        overlap_k = 0
+        p_hfo = getattr(self.args, 'p_history_future_overlap', 0.0)
+        if p_hfo > 0.0 and torch.rand(1).item() < p_hfo:
+            overlap_k = random.randint(1, self.args.num_frames - 1)
+            orig_current = latents[:, num_history:num_history + 1].clone()
+            overlap_latents = latents[:, num_history + 1 : num_history + 1 + overlap_k]
+            overlap_action = action[:, num_history + 1 : num_history + 1 + overlap_k]
+
+            # False-future augmentation: with probability p_false_future (drawn
+            # per-sample in dataset.py), replace the peeked overlap frames with
+            # a mismatched future from a different episode. The diffusion
+            # target below (latents[:, num_history:]) is untouched -- always
+            # the true continuation -- so this breaks the "peek == answer"
+            # shortcut instead of adding a new loss term. See config.py's
+            # p_false_future docstring.
+            if 'false_future_latent' in batch:
+                use_ff = batch['use_false_future'].to(device).view(-1, 1, 1, 1, 1)
+                false_latents = batch['false_future_latent'][:, :overlap_k].to(device)
+                overlap_latents = torch.where(use_ff, false_latents, overlap_latents)
+
+            # Zero the overlap slot's action conditioning (both true- and
+            # false-peek cases) -- the correct future action is already
+            # present, unmodified, at the true target position below, so a
+            # real action here is redundant and would give an action<->frame
+            # consistency shortcut. See config.py's zero_overlap_action
+            # docstring; inference call sites must match via --overlap_zero_action.
+            if getattr(self.args, 'zero_overlap_action', False):
+                overlap_action = torch.zeros_like(overlap_action)
+
+            latents = torch.cat([latents[:, :num_history], overlap_latents, latents[:, num_history:]], dim=1)
+            action = torch.cat([action[:, :num_history], overlap_action, action[:, num_history:]], dim=1)
+            num_history = num_history + overlap_k  # everything below keys off this local var
+            assert torch.equal(latents[:, num_history:num_history + 1], orig_current), \
+                "history-future-overlap splice must preserve the original current frame at the new index"
+
         bsz, num_frames = latents.shape[:2]
 
         # current img as condition image to stack at channel wise, add random noise to current image, noise strength 0.0~0.2
@@ -420,7 +465,6 @@ class CrtlWorld(nn.Module):
             condition_latent[:, :num_history] = 0.0
 
         # action condition
-        action = batch['action'].to(device)  # (B,f,7)
         action_hidden = self.action_encoder(action, texts, self.tokenizer, self.text_encoder, frame_level_cond=self.args.frame_level_cond) # (B, f, 1024)
 
         #  for classifier-free guidance, with 5% probability, set action_hidden to 0
@@ -430,9 +474,16 @@ class CrtlWorld(nn.Module):
 
         ##################################### Flow Matching + Shortcut ####################################
         
-        # add 0~0.3 noise to history, history as condition
+        # add 0~0.3 noise to history, history as condition (overlap slots -- the tail
+        # `overlap_k` entries holding spliced-in future frames -- get a smaller,
+        # separately-configured noise cap so they stay a strong/near-clean signal,
+        # matching the near-clean self-generated frames pass 2 will feed at inference)
         history = latents[:, :num_history] # (B, num_history, 4, 32, 32)
-        sigma_h = torch.randn([bsz, num_history, 1, 1, 1], device=device) * 0.3
+        true_hist_len = num_history - overlap_k
+        sigma_scale = torch.full([bsz, num_history, 1, 1, 1], 0.3, device=device)
+        if overlap_k > 0:
+            sigma_scale[:, true_hist_len:num_history] = self.args.history_overlap_noise_scale
+        sigma_h = torch.randn([bsz, num_history, 1, 1, 1], device=device) * sigma_scale
         c_in_h = 1 / (sigma_h**2 + 1) ** 0.5
         noisy_history = c_in_h * (history + sigma_h * torch.randn_like(history)) # (B, num_history, 4, 32, 32)
 

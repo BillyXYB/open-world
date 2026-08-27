@@ -114,6 +114,50 @@ class LiberoWMArgs:
     # Simulates scenarios where only the immediately preceding frame is available.
     # 0.0 = disabled (backward-compatible).
     p_single_history: float = 0.0
+    # With this probability (drawn once per training step / micro-batch, not
+    # per-sample), grow the history window by k in [1, num_frames-1] extra
+    # slots holding frame_now+1..frame_now+k -- the SAME future frames that
+    # also appear in the noised target block. Teaches a self-refinement
+    # objective: reconstruct frames the model is simultaneously shown as
+    # (noise-augmented) clean context. Implemented entirely inside
+    # CrtlWorld.forward() -- no dataset.py changes, since the future frames
+    # needed are already loaded for every sample. Makes the "run twice,
+    # splice pass-1 predictions into history, run again" inference-time
+    # self-consistency check (uq_epi_mode="future_overlap") in-distribution
+    # for the checkpoint. 0.0 = disabled (backward-compatible).
+    p_history_future_overlap: float = 0.0
+    # Noise-augmentation std-dev cap applied to the overlap history slots
+    # specifically (separate from the fixed 0.3 used for true-past history
+    # in forward()). Kept small so overlap context stays a strong/near-clean
+    # signal, matching the near-clean self-generated frames the checkpoint
+    # will be fed at inference-time pass 2.
+    history_overlap_noise_scale: float = 0.05
+    # Conditional on the history-future-overlap branch firing: with this
+    # probability, replace the peeked future frames with a mismatched future
+    # drawn from a different episode instead of the true continuation. Breaks
+    # the "peek == answer" shortcut that let the logvar head learn
+    # content-independent confidence (see droid_flow_matching_uq_future_overlap_v1's
+    # known collapse -- near-uniform overconfidence regardless of whether the
+    # peek is actually plausible). Implemented in dataset.py (samples a
+    # distractor episode's future latents) and spliced in inside
+    # CrtlWorld.forward(), which still supervises the diffusion loss against
+    # the TRUE target future regardless -- so a false peek naturally produces
+    # higher prediction error and, via the existing NLL uq_loss, higher
+    # predicted uncertainty, with no new loss term needed.
+    # Only meaningful when p_history_future_overlap > 0. 0.0 = disabled.
+    p_false_future: float = 0.0
+    # If True, zero the action conditioning at the overlap slot (both true-
+    # and false-peek cases) instead of leaving the real trajectory's action
+    # there. The correct future action is always separately available at the
+    # true target position regardless of the overlap splice, so a real
+    # action at the overlap slot is redundant and gives the model an
+    # action<->frame consistency shortcut that bypasses judging the peeked
+    # frame's own plausibility. Default False preserves
+    # droid_flow_matching_uq_future_overlap_v1's exact behavior --
+    # scripts/replay_libero_wm_traj.py and run_droid_hardware_active_uq.py
+    # must be evaluated with a matching --overlap_zero_action flag, since v1
+    # was trained with a real action there.
+    zero_overlap_action: bool = False
 
     flow_map_loss_type: str = "lsd"
     psd_sample_mode: str = "uniform"
@@ -127,10 +171,22 @@ class LiberoWMArgs:
     single_bs_mode: bool = False
 
     def __post_init__(self) -> None:
-        if self.p_future_in_history > 0.0 and self.p_single_history > 0.0:
+        _n_exclusive = sum(
+            p > 0.0
+            for p in (self.p_future_in_history, self.p_single_history, self.p_history_future_overlap)
+        )
+        if _n_exclusive > 1:
             raise ValueError(
-                "p_future_in_history and p_single_history are mutually exclusive; "
-                "set at most one of them to a non-zero value."
+                "p_future_in_history, p_single_history, and p_history_future_overlap are "
+                "mutually exclusive for now; set at most one to a non-zero value. "
+                "(p_history_future_overlap is implemented independently in CrtlWorld.forward() "
+                "rather than dataset.py, so relaxing this to allow composition later is a "
+                "one-line change -- remove this check -- once each effect is validated alone.)"
+            )
+        if self.p_false_future > 0.0 and self.p_history_future_overlap <= 0.0:
+            raise ValueError(
+                "p_false_future is only meaningful when p_history_future_overlap > 0 "
+                "(it replaces the overlap-peek content conditionally on that branch firing)."
             )
         self.output_dir = f"checkpoints/wm_libero/{self.tag}"
         self.wandb_run_name = self.tag

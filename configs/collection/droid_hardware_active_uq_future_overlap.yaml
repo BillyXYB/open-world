@@ -1,0 +1,180 @@
+# Active, epistemic-UQ-guided Pi0.5 rollouts on real DROID hardware: at
+# each interaction round-trip, sample several candidate action chunks,
+# score each one's EPISTEMIC uncertainty via a configurable pass-2
+# self-consistency strategy (active_uq.uq_epi_mode below -- see
+# scripts/run_droid_hardware_active_uq.py's module docstring and
+# _build_pass2_inputs), and send back the most uncertain candidate.
+#
+# This config pairs the "future_overlap" self-consistency mode with the
+# droid_flow_matching_uq_future_overlap_v1 checkpoint (trained with
+# p_history_future_overlap=0.5 -- see
+# configs/training/droid_wm_uq_future_overlap.py's docstring). For the other
+# trained checkpoints, use the sibling configs in this directory:
+#   droid_hardware_active_uq.yaml              -- single_hist_v1 / single_history
+#   droid_hardware_active_uq_future_hist.yaml   -- future_hist_v0 / iterative
+#
+# The robot side (uq_data_collection/examples/droid/main.py) is NOT modified
+# -- this server is a drop-in replacement for
+# svd_ac_video_model/vidwm/evaluators/uq_data_collection.py, talking to the
+# exact same comms-dir file protocol (comms_mode: file, the default below).
+#
+# Run with:
+#   uv run python scripts/run_droid_hardware_active_uq.py \
+#       --config configs/collection/droid_hardware_active_uq_future_overlap.yaml
+#
+# ==============================================================================
+# KNOWN CAVEAT -- why this config uses _v1, not _v0:
+# droid_flow_matching_uq_future_overlap_v0's own training docstring records
+# that its checkpoint-190000 showed the logvar head "collapsing to
+# near-uniform overconfidence on overlap slots (mean_pdf_diff ~2.68, stdev
+# 0.13 across 739 chunks) -- a near-constant global shift, not content-driven
+# epistemic signal," caused by near-clean overlap context letting the model
+# shortcut to "trivially certain" instead of learning graded confidence. _v1
+# fixes this (history_overlap_noise_scale 0.05 -> 0.3) and was trained fresh
+# (not warm-started from v0, whose weights may have baked in the shortcut).
+# Do not point wm_checkpoint below at the v0 directory's checkpoint-190000.pt.
+#
+# Regardless of which checkpoint/mode you use: treat first runs on any new
+# checkpoint/uq_epi_mode PAIRING as a pilot -- inspect decision_metrics.jsonl's
+# candidate spreads (do the 7 logged UQ metrics actually discriminate between
+# candidates, or collapse to near-identical values?) before trusting the
+# collected data. A pass on one pairing does not transfer to another. Given
+# v0's history here, this applies with extra force to future_overlap -- an
+# augmentation that looked reasonable on paper already produced degenerate
+# UQ output once for this exact checkpoint family.
+# ==============================================================================
+
+policy:
+  config_name: pi05_droid
+  checkpoint_path: gs://openpi-assets/checkpoints/pi05_droid
+  repo_path: external/openpi
+  pytorch_device: cuda
+  # Ctrl-World's joint-velocity -> future-joint-position dynamics MLP
+  # (same checkpoint svd_ac_video_model/vidwm's hardware pipeline uses).
+  act_adapter_path: /scratch/gpfs/AM43/users/os6279/research/utilities/huggingface/hub/Ctrl-World/action_adapter/model2_15_9.pth
+  gripper_max: 0.75
+
+hardware:
+  # "file" (default): talk to the robot via the comms-dir file protocol
+  # below (droid_comms.py) -- unchanged, zero-config-change backward
+  # compatible behavior.
+  # "socket": hold one persistent websocket connection per trajectory
+  # instead (droid_comms_socket.py), cutting disk/rsync/polling latency.
+  # Requires the robot to reach socket_host:socket_port -- since only SSH
+  # is a proven path to this node, tunnel it from the robot laptop:
+  #   ssh -N -L 8765:localhost:8765 -J yx2653@tigressgateway.princeton.edu yx2653@della-ani.princeton.edu
+  # then launch main.py with --comms_mode socket --remote_host localhost
+  # --remote_port 8765 (matching whatever local port you forward).
+  comms_mode: socket
+  # socket mode only -- bind address. Keep 127.0.0.1 (NOT exposed
+  # externally); reach it only via the SSH tunnel above.
+  socket_host: 127.0.0.1
+  socket_port: 8765
+  # Shared comms dir with the robot (file mode only) -- identical path
+  # svd_ac_video_model/vidwm/evaluators/uq_data_collection.py uses
+  # (Path(__file__).parents[1] / "scripts/outputs/planner/hardware/comms"),
+  # so the robot's main.py needs no changes when using comms_mode: file.
+  comms_dir: /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/svd_ac_video_model/vidwm/scripts/outputs/planner/hardware/comms
+  # Which physical camera feeds the policy's single "exterior" view --
+  # mirrors uq_data_collection/examples/droid/main.py's `external_camera`
+  # Args field (left/right). The world model always conditions on ALL
+  # THREE cameras regardless of this setting (see WM_CAM_KEYS).
+  external_camera: right
+  poll_interval_s: 0.2
+  obs_timeout_s: 60
+  # Real robot control-loop steps per trajectory before forcing a stop if
+  # the robot never signals trajectory_{traj_idx}_done.txt -- a safety cap,
+  # not the primary termination signal.
+  max_steps: 10000
+  # null = run forever (Ctrl+C to stop); set an integer to auto-stop after
+  # N trajectories, e.g. for a pilot run.
+  num_trajectories: 2
+
+active_uq:
+  num_candidates: 4
+  # Any of: mean_aleatoric_var, max_aleatoric_var, mean_epi_ltv,
+  # max_epi_ltv, mean_epi_var, mean_pdf_diff, mean_kl. All seven are logged
+  # per candidate in decision_metrics.jsonl regardless of which one is used
+  # to select -- change this to retune without touching code.
+  uq_metric: mean_pdf_diff
+  # Pass-2 (epistemic self-consistency) conditioning strategy -- MUST match
+  # how the loaded wm_checkpoint below was trained (mismatched mode/checkpoint
+  # pairs run without error but produce a meaningless epistemic signal):
+  #   iterative        <-> droid_flow_matching_uq_future_hist_v0/v1
+  #   single_history    <-> droid_flow_matching_uq_single_hist_v1
+  #   future_overlap    <-> droid_flow_matching_uq_future_overlap_v0/v1   [this config]
+  #   zero_history / flat_history: no dedicated checkpoint yet -- parity
+  #     with replay_libero_wm_traj.py, usable with any checkpoint.
+  #   none: skip pass-2 entirely -- only mean_aleatoric_var/max_aleatoric_var
+  #     are valid uq_metric choices above, and viz.enabled below must be false.
+  uq_epi_mode: future_overlap
+  # How many of each candidate's own future frames to splice into pass-2's
+  # history. 0 = max (num_frames - 1). The sibling job
+  # jobs/replay_droid_wm_traj_epi_overlap_k_sweep.sh sweeps this explicitly
+  # if the max setting's UQ signal looks degenerate -- worth trying smaller
+  # explicit values (e.g. 1 or 2) before concluding the pairing doesn't work.
+  epi_overlap_k: 0
+  # Denoising steps per candidate-scoring pipeline call (2 calls/decision,
+  # batched across candidates). Start low for speed; raise only if
+  # candidate ranking proves unstable (see the plan's verification section).
+  num_inference_steps: 15
+  # v1, NOT v0 -- see KNOWN CAVEAT above. Latest available step for this
+  # checkpoint family (checkpoint-80000/90000/100000.pt also exist on disk
+  # under the same directory).
+  wm_checkpoint: checkpoints/wm_droid/droid_flow_matching_uq_future_overlap_v1/checkpoint-120000.pt
+  stat_root: /scratch/gpfs/AM43/yy4041/data/dataset_meta_info
+  clip_model_path: external/clip-vit-base-patch32
+  # DROID camera layout this checkpoint was trained on -- do not change
+  # without retraining.
+  num_cams: 3
+  height: 192
+  width: 320
+  # Correct native value for this checkpoint (trained with down_sample=3
+  # from the start -- no workaround needed, unlike future_hist_v0).
+  down_sample: 3
+  # Stride/length used to slice each candidate's 15-step kinematic
+  # (OpenPIActionAdapter) rollout into the 5 steps reused for BOTH the
+  # world model's future-conditioning targets and the robot wire format.
+  # wire_len MUST be 5 (the robot hardcodes `assert
+  # pred_action_chunk.shape == (5, 8)`) and MUST equal the checkpoint's
+  # num_frames -- the script asserts both at startup.
+  wire_skip: 2
+  wire_len: 5
+  viz:
+    # Candidate-comparison videos, for visually auditing whether uq_metric
+    # is actually picking sensible candidates. Adds ZERO extra world-model
+    # inference (reuses what scoring already computed) but does add
+    # VAE-decode + video-encode cost per saved decision -- leave off for
+    # large collection runs, turn on for small pilot/diagnostic runs.
+    enabled: true
+    every_n_decisions: 2
+    max_decisions_per_episode: 200
+    fps: 3
+
+save:
+  # WM training-data export (SVD latents + annotation JSON, matching the
+  # real droid_ctrl_world schema -- see
+  # openworld/utils/droid_export.py::write_droid_episode), so collected
+  # hardware trajectories are directly usable for future WM retraining, on
+  # top of whatever the robot's own trajectory.h5/mp4 saving records
+  # (see the root CLAUDE.md's Output Structure).
+  output_root: data/droid_hardware_active_uq_collected
+  # Per-experiment (checkpoint + uq_epi_mode pairing) suite name -- keeps
+  # this run's annotation/raw_videos/latent_videos/candidate_viz/
+  # decision_metrics.jsonl fully separated from other checkpoint/mode
+  # experiments on disk. Rename this whenever active_uq.wm_checkpoint or
+  # active_uq.uq_epi_mode above changes to a new pairing.
+  suite_name: droid_ctrl_world_hardware_future_overlap_v1
+  write_raw: true
+  encode_latents: true
+  svd_path: external/stable-video-diffusion-img2vid
+  device: cuda
+  # Collected data has ONE sample per round-trip for both camera frames and
+  # state (no separately-denser native-rate recording the way
+  # droid_ctrl_world's original 3x-oversampled capture does) -- so this is
+  # 1, NOT active_uq.down_sample's 3 (that one is about the ORIGINAL
+  # training data's rate mismatch, unrelated to newly collected data).
+  down_sample: 1
+  raw_fps: 15
+  num_history: 6
+  num_frames: 5

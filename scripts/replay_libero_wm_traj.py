@@ -64,9 +64,17 @@ def list_episode_ids(data_root: str, suite: str, split: str) -> list[str]:
 
 
 def load_full_episode(
-    data_root: str, suite: str, episode_id: str, args: LiberoWMArgs, split: str
+    data_root: str, suite: str, episode_id: str, args: LiberoWMArgs, split: str,
+    down_sample: int = 1, native_fps_default: int = 20,
 ) -> tuple[torch.Tensor, np.ndarray, str, int]:
-    """Return (latent[T,4,total_h,latent_w] fp32, action[T,7] fp32, text, native_fps)."""
+    """Return (latent[T,4,total_h,latent_w] fp32, action[T,7] fp32, text, native_fps).
+
+    ``down_sample`` corrects for datasets (e.g. DROID's droid_ctrl_world)
+    where the action/state arrays are stored at a higher native rate than
+    the pre-encoded latents: state index ``i * down_sample`` is paired with
+    latent frame ``i``. Defaults to 1 (LIBERO's collected data has state and
+    latents at the same rate, so this is a no-op there).
+    """
     suite_dir = os.path.join(data_root, suite)
     with open(os.path.join(suite_dir, args.annotation_name, split, f"{episode_id}.json")) as f:
         label = json.load(f)
@@ -91,14 +99,71 @@ def load_full_episode(
     grip = np.asarray(label["observation.state.gripper_position"], dtype=np.float32)
     if grip.ndim == 1:
         grip = grip[:, None]
-    action_native = np.concatenate([cart, grip], axis=-1)[:T]  # (T, 7)
+    full_state = np.concatenate([cart, grip], axis=-1)  # (S, 7), at native state rate
+    state_idx = np.clip(np.arange(T) * down_sample, 0, len(full_state) - 1)
+    action_native = full_state[state_idx]  # (T, 7), aligned 1:1 with latent frames
 
     text = label["texts"][0] if label.get("texts") else label.get("language_instruction", "")
-    return latent, action_native, text, int(label.get("fps", 20))
+    return latent, action_native, text, int(label.get("fps", native_fps_default))
 
 
 def normalize_actions(action: np.ndarray, p01: np.ndarray, p99: np.ndarray) -> np.ndarray:
     return np.clip(2 * (action - p01) / (p99 - p01 + 1e-8) - 1, -1, 1)
+
+
+def load_crtl_world(
+    checkpoint: str,
+    *,
+    svd_model_path: str,
+    clip_model_path: str,
+    data_root: str,
+    stat_root: str,
+    suites: list[str],
+    device: torch.device,
+    predict_uncertainty: bool = True,
+    uq_vis_t_targets: tuple[float, ...] = (0.9, 0.5, 0.1),
+    tag: str = "libero_replay",
+    num_cams: int = 2,
+    height: int = 320,
+    width: int = 320,
+    down_sample: int = 1,
+) -> tuple[CrtlWorld, type[CtrlWorldDiffusionPipeline], LiberoWMArgs, bool]:
+    """Build ``LiberoWMArgs``, construct ``CrtlWorld``, and load a checkpoint.
+
+    Shared by ``replay_libero_wm_traj.py``'s CLI and any other script that
+    needs to score candidates with this world model (see
+    ``scripts/run_data_collection_active_uq.py``).
+
+    ``num_cams``/``height``/``width``/``down_sample`` default to LIBERO's
+    values; pass DROID's (3, 192, 320, 3) to replay a DROID checkpoint.
+
+    Returns (model, pipeline_cls, args, use_uq).
+    """
+    args = LiberoWMArgs(
+        svd_model_path=svd_model_path, clip_model_path=clip_model_path,
+        dataset_root_path=data_root, dataset_meta_info_path=stat_root,
+        dataset_names="+".join(suites), dataset_cfgs="+".join(suites),
+        prob=tuple([1.0 / len(suites)] * len(suites)),
+        num_cams=num_cams, height=height, width=width,
+        num_frames=5, num_history=6, action_dim=7, down_sample=down_sample,
+        flow_map_type="flow_matching", distance_conditioning=False, tag=tag,
+        predict_uncertainty=predict_uncertainty,
+        uq_vis_t_targets=tuple(uq_vis_t_targets),
+    )
+
+    print(f"[wm] loading checkpoint {checkpoint}")
+    model = CrtlWorld(args)
+    missing, unexpected = model.load_state_dict(
+        torch.load(checkpoint, map_location="cpu"), strict=False)
+    if missing:
+        print(f"[wm] {len(missing)} missing keys (e.g. {missing[:3]})")
+    if unexpected:
+        print(f"[wm] {len(unexpected)} unexpected keys (e.g. {unexpected[:3]})")
+    model.to(device).eval()
+    use_uq = args.predict_uncertainty and getattr(model.unet, "predict_uncertainty", False)
+    if args.predict_uncertainty and not use_uq:
+        print("[wm] WARNING: --predict_uncertainty set but checkpoint has no UQ head; disabling.")
+    return model, CtrlWorldDiffusionPipeline, args, use_uq
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +188,12 @@ def replay_episode(
     text: str, device: torch.device,
     num_inference_steps: int, skip: int, max_chunks: int | None,
     use_uq: bool = False,
-    uq_epi_mode: str = "none",      # "none" | "zero_history" | "flat_history" | "iterative"
-    on_chunk=None,                  # Callable[[int,int,list,list,list,list,list],None] | None
+    uq_epi_mode: str = "none",      # "none" | "zero_history" | "flat_history" | "single_history" | "iterative" | "future_overlap"
+    epi_overlap_k: int = 0,         # uq_epi_mode="future_overlap" only: 0 = use num_frames-1 (max overlap)
+    overlap_zero_action: bool = False,  # uq_epi_mode="future_overlap" only: zero the overlap slot's action
+                                         # conditioning instead of the real candidate action -- must match
+                                         # the checkpoint's zero_overlap_action training setting.
+    on_chunk=None,                  # Callable[[int,int,list,list,list,list,list,float|None,float|None],None] | None
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[torch.Tensor],
            torch.Tensor | None, list[torch.Tensor]]:
     """Closed-loop rollout.
@@ -201,7 +270,11 @@ def replay_episode(
         pred = pred_latents[0].float().cpu()  # (num_frames, 4, total_h, latent_w)
 
         # ---- Pass 2 (epistemic) ----
+        overlap_k_used: int | None = None
+        overlap_latent_mse: float | None = None
+        full_latent_mse: float | None = None
         if uq_epi_mode != "none":
+            action_latent2 = action_latent  # default: unchanged (matches all modes except future_overlap)
             if uq_epi_mode == "zero_history":
                 history2, current2, his_cond_zero2 = history, current, True
             elif uq_epi_mode == "flat_history":
@@ -213,6 +286,25 @@ def replay_episode(
                 last_hist = history[:, -1:, :, :, :]  # (1, 1, 4, total_h, latent_w)
                 history2 = last_hist.expand(-1, num_history, -1, -1, -1).contiguous()
                 current2, his_cond_zero2 = current, False
+            elif uq_epi_mode == "future_overlap":
+                # Splice pass-1's OWN predicted future frames into history, keep current
+                # UNCHANGED, and re-predict the SAME target range (mirrors training's
+                # p_history_future_overlap augmentation in CrtlWorld.forward()).
+                overlap_k_used = epi_overlap_k if epi_overlap_k > 0 else (num_frames - 1)
+                overlap_k_used = max(1, min(overlap_k_used, num_frames - 1))
+                overlap_frames = pred[1:1 + overlap_k_used].unsqueeze(0).to(device)  # pred = pass-1 output
+                history2 = torch.cat([history, overlap_frames], dim=1)
+                current2, his_cond_zero2 = current, False  # MUST reuse pass-1's `current` verbatim -- target range/current frame unchanged; do not recompute
+                if overlap_zero_action:
+                    overlap_action_t = torch.zeros(1, overlap_k_used, action_norm.shape[-1],
+                                                    dtype=torch.float32, device=device)
+                else:
+                    overlap_action_vals = action_norm[[state_id[num_history + i] for i in range(1, 1 + overlap_k_used)]]
+                    overlap_action_t = torch.tensor(overlap_action_vals, dtype=torch.float32).unsqueeze(0).to(device)
+                action2_for_encoder = torch.cat([action, overlap_action_t], dim=1)
+                with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                    action_latent2 = model.action_encoder(
+                        action2_for_encoder, [text], model.tokenizer, model.text_encoder, args.frame_level_cond)
             else:  # iterative
                 history2 = torch.stack([rolled2[rgb_id[i]] for i in range(num_history)], 0).unsqueeze(0).to(device)
                 current2 = rolled2[rgb_id[num_history]].unsqueeze(0).to(device)
@@ -220,7 +312,7 @@ def replay_episode(
 
             with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
                 result2 = pipeline_cls.__call__(
-                    pipeline, image=current2, text=action_latent,
+                    pipeline, image=current2, text=action_latent2,
                     width=args.width, height=int(args.num_cams * args.height),
                     num_frames=num_frames, history=history2,
                     num_inference_steps=num_inference_steps, decode_chunk_size=args.decode_chunk_size,
@@ -238,6 +330,11 @@ def replay_episode(
                 logvar_steps2 = []
                 vel_steps2 = []
             pred2 = pred_latents2[0].float().cpu()  # (num_frames, 4, total_h, latent_w)
+
+            if overlap_k_used is not None:
+                # Checkpoint-agnostic divergence metric -- works even without a UQ head.
+                overlap_latent_mse = float(((pred[1:1 + overlap_k_used] - pred2[1:1 + overlap_k_used]) ** 2).mean())
+                full_latent_mse = float(((pred - pred2) ** 2).mean())
 
         for k in range(num_frames):
             t_native = rgb_id[num_history + k]
@@ -269,13 +366,15 @@ def replay_episode(
                     if uq_epi_mode == "iterative" and rolled2 is not None:
                         rolled2[t_native] = pred[k].clone()  # use Pass-1 predictions
 
-        # Per-chunk callback: stream UQ metrics for this chunk's predicted frames
-        if on_chunk is not None and logvar_steps:
+        # Per-chunk callback: stream UQ metrics for this chunk's predicted frames.
+        # Fires even without a UQ head (logvar_steps empty) when overlap_latent_mse is
+        # available, so uq_epi_mode="future_overlap" is smoke-testable on any checkpoint.
+        if on_chunk is not None:
             chunk_frame_indices = [
                 rgb_id[num_history + k] for k in range(num_frames)
                 if rgb_id[num_history + k] < T
             ]
-            if chunk_frame_indices:
+            if chunk_frame_indices and (logvar_steps or overlap_latent_mse is not None):
                 n_ode = len(logvar_steps)
                 chunk_lv = [
                     torch.stack([frame_logvar[t][s] for t in chunk_frame_indices], 0)
@@ -294,7 +393,8 @@ def replay_episode(
                     for s in range(n_ode)
                 ] if epi_frame_vel else []
                 on_chunk(chunk_idx, frame_now, chunk_frame_indices,
-                         chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel)
+                         chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel,
+                         overlap_latent_mse, full_latent_mse)
         chunk_idx += 1
 
     if chunk_idx == 0:
@@ -427,6 +527,39 @@ def _turbo_heatmap(
     return np.stack(frames, 0)
 
 
+def _diverging_heatmap(
+    signal: torch.Tensor,   # (T, 1, total_h, latent_w) — SIGNED, e.g. exp(lv2)-exp(lv1) unclamped
+    args: LiberoWMArgs,
+    cmap_name: str = "coolwarm",
+) -> np.ndarray:
+    """Like _turbo_heatmap but symmetric around 0 with a diverging colormap, so sign is
+    visible (not just magnitude). Normalizes by the whole stack's max |value| (not
+    independent min/max) so 0 always maps to the colormap's neutral center -- a plain
+    min-max normalize would shift the zero point off-center whenever the signal is
+    skewed to one side, which turbo-style sequential heatmaps don't need to care about
+    but a diverging one does."""
+    import matplotlib
+    import torch.nn.functional as F_nn
+
+    up = F_nn.interpolate(
+        signal.float(), size=(args.num_cams * args.height, args.width),
+        mode="bilinear", align_corners=False,
+    )[:, 0].cpu().numpy()  # (T, num_cams*H, W)
+    vmax = float(np.abs(up).max())
+    norm = (up / vmax + 1.0) / 2.0 if vmax > 0 else np.full_like(up, 0.5)  # [-vmax,vmax] -> [0,1], 0 -> 0.5
+    norm = np.clip(norm, 0.0, 1.0)
+    cmap = matplotlib.colormaps[cmap_name]
+    per_cam = norm.reshape(norm.shape[0], args.num_cams, args.height, args.width)
+    frames = [
+        np.concatenate(
+            [(cmap(per_cam[t, c])[..., :3] * 255).astype(np.uint8)
+             for c in range(args.num_cams)], axis=0
+        )
+        for t in range(per_cam.shape[0])
+    ]
+    return np.stack(frames, 0)
+
+
 def _render_vel_ltv_video(
     vel1: torch.Tensor,   # (T, 4, total_h, latent_w) — v_pred from pass 1
     vel2: torch.Tensor,   # (T, 4, total_h, latent_w) — v_pred from pass 2
@@ -470,9 +603,34 @@ def _render_epi_var_video(
     logvar_stack2: torch.Tensor,  # (T, 1, total_h, latent_w)  — pass 2
     args: LiberoWMArgs,
 ) -> np.ndarray:
-    """Epistemic var: (exp(lv2) - exp(lv1)).clamp(0) → turbo heatmap."""
+    """Epistemic var: (exp(lv2) - exp(lv1)).clamp(0) → turbo heatmap.
+
+    One-directional by design: built to check "did the model get MORE uncertain
+    given worse conditioning" (zero_history/flat_history/single_history/iterative,
+    where pass 2 conditions on strictly less/worse info than pass 1). For
+    future_overlap, pass 2 conditions on strictly MORE info, so the "expected"
+    direction is reversed -- clamping here would show ~0 even when there's a large,
+    real (just oppositely-signed) effect. Use _render_epi_var_signed_video instead
+    to see both directions at once."""
     epi_var = (logvar_stack2.exp() - logvar_stack1.exp()).clamp(min=0)
     return _turbo_heatmap(epi_var, args)
+
+
+def _render_epi_var_signed_video(
+    logvar_stack1: torch.Tensor,  # (T, 1, total_h, latent_w)  — pass 1
+    logvar_stack2: torch.Tensor,  # (T, 1, total_h, latent_w)  — pass 2
+    args: LiberoWMArgs,
+) -> np.ndarray:
+    """Signed epistemic var: exp(lv2) - exp(lv1), UNCLAMPED → diverging heatmap.
+    Same sign convention as _render_epi_var_video (positive = pass 2 MORE uncertain
+    than pass 1) but keeps the negative side visible instead of clamping it away.
+    Warm/positive = pass 2 more uncertain (the anomalous direction for future_overlap,
+    since pass 2 has strictly more context -- localized warm regions here would be
+    genuine content-driven epistemic disagreement). Cool/negative = pass 2 more
+    confident (the direction a global length-driven confidence collapse would show
+    as, uniformly, across the whole frame)."""
+    epi_var_signed = logvar_stack2.exp() - logvar_stack1.exp()
+    return _diverging_heatmap(epi_var_signed, args)
 
 
 def compute_uq_metrics(
@@ -512,6 +670,13 @@ def compute_uq_metrics(
              for s in range(n)], 0
         ).mean(0)
         metrics["mean_epi_var"] = float(agg_epi_var.mean())
+        # EpiVarSigned: same quantity, UNCLAMPED -- keeps the "pass 2 more confident"
+        # direction visible instead of discarding it. See _render_epi_var_signed_video.
+        agg_epi_var_signed = torch.stack(
+            [(epi_logvar_by_step[s].exp() - logvar_by_step[s].exp()).squeeze(1)
+             for s in range(n)], 0
+        ).mean(0)
+        metrics["mean_epi_var_signed"] = float(agg_epi_var_signed.mean())
         # PDFDiff: 0.5*|lv1-lv2|
         agg_pdf = torch.stack(
             [0.5 * (logvar_by_step[s] - epi_logvar_by_step[s]).abs().squeeze(1)
@@ -573,15 +738,43 @@ def main() -> None:
     p.add_argument("--uq_vis_t_targets", type=float, nargs="+", default=[0.9, 0.5, 0.1],
                    help="Target t-values for UQ visualization columns (closest ODE step is used).")
     p.add_argument("--uq_epi_mode", default="none",
-                   choices=["none", "zero_history", "flat_history", "single_history", "iterative"],
+                   choices=["none", "zero_history", "flat_history", "single_history",
+                            "iterative", "future_overlap"],
                    help="Epistemic UQ mode: 'zero_history'=his_cond_zero pass, "
                         "'flat_history'=repeat current frame as history, "
                         "'single_history'=repeat most-recent history frame for all slots, "
-                        "'iterative'=self-consistency (pass 2 uses pass-1 predictions as history).")
+                        "'iterative'=self-consistency (pass 2 uses pass-1 predictions as history), "
+                        "'future_overlap'=splice pass-1's own predicted future frames into history "
+                        "and re-predict the SAME target range (requires a checkpoint trained with "
+                        "p_history_future_overlap>0 for meaningful results; see --epi_overlap_k).")
+    p.add_argument("--epi_overlap_k", type=int, default=0,
+                   help="Overlap width k for uq_epi_mode=future_overlap; 0 (default) = "
+                        "num_frames-1 (max overlap, uses all of pass-1's predicted future "
+                        "as pass-2 context). Must be in [1, num_frames-1].")
+    p.add_argument("--overlap_zero_action", action="store_true",
+                   help="For uq_epi_mode=future_overlap: zero the action conditioning at the "
+                        "overlap slot instead of using the real candidate action. Must match "
+                        "the checkpoint's zero_overlap_action training setting -- set this for "
+                        "checkpoints trained with zero_overlap_action=True (e.g. "
+                        "droid_flow_matching_uq_false_future_v1), leave unset for "
+                        "droid_flow_matching_uq_future_overlap_v1 and earlier.")
     p.add_argument("--manifest", default=None,
                    help="Path to test_manifest_by_cell.json for cell-balanced episode selection.")
     p.add_argument("--max_episodes_per_cell", type=int, default=0,
                    help="Cap episodes per cell from manifest (0 = all).")
+    p.add_argument("--num_cams", type=int, default=2,
+                   help="Camera views stacked into the latent (LIBERO=2, DROID=3).")
+    p.add_argument("--height", type=int, default=320,
+                   help="Per-camera pixel height (LIBERO=320, DROID=192).")
+    p.add_argument("--width", type=int, default=320,
+                   help="Per-camera pixel width (LIBERO=320, DROID=320).")
+    p.add_argument("--down_sample", type=int, default=1,
+                   help="Native-state-rate / latent-rate ratio (LIBERO=1, DROID=3; "
+                        "see load_full_episode docstring).")
+    p.add_argument("--native_fps_default", type=int, default=20,
+                   help="Fallback native fps when the annotation JSON has no 'fps' key "
+                        "(LIBERO collected data always has one; DROID's droid_ctrl_world "
+                        "never does — pass e.g. 5 there so the restride below is a no-op).")
     a = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -589,30 +782,15 @@ def main() -> None:
               if a.suites else list_suites(a.data_root))
     out_root = Path(a.output_dir) if a.output_dir else Path(a.checkpoint).resolve().parent / "replay"
 
-    args = LiberoWMArgs(
+    model, pipeline_cls, args, use_uq = load_crtl_world(
+        a.checkpoint,
         svd_model_path=a.svd_model_path, clip_model_path=a.clip_model_path,
-        dataset_root_path=a.data_root, dataset_meta_info_path=a.stat_root,
-        dataset_names="+".join(suites), dataset_cfgs="+".join(suites),
-        prob=tuple([1.0 / len(suites)] * len(suites)),
-        num_cams=2, num_frames=5, num_history=6, action_dim=7, down_sample=1,
-        flow_map_type="flow_matching", distance_conditioning=False, tag="libero_replay",
-        predict_uncertainty=a.predict_uncertainty,
-        uq_vis_t_targets=tuple(a.uq_vis_t_targets),
+        data_root=a.data_root, stat_root=a.stat_root, suites=suites, device=device,
+        predict_uncertainty=a.predict_uncertainty, uq_vis_t_targets=a.uq_vis_t_targets,
+        tag="libero_replay",
+        num_cams=a.num_cams, height=a.height, width=a.width, down_sample=a.down_sample,
     )
-
-    print(f"[replay] loading checkpoint {a.checkpoint}")
-    model = CrtlWorld(args)
-    missing, unexpected = model.load_state_dict(
-        torch.load(a.checkpoint, map_location="cpu"), strict=False)
-    if missing:
-        print(f"[replay] {len(missing)} missing keys (e.g. {missing[:3]})")
-    if unexpected:
-        print(f"[replay] {len(unexpected)} unexpected keys (e.g. {unexpected[:3]})")
-    model.to(device).eval()
-    pipeline, pipeline_cls = model.pipeline, CtrlWorldDiffusionPipeline
-    use_uq = args.predict_uncertainty and getattr(model.unet, "predict_uncertainty", False)
-    if args.predict_uncertainty and not use_uq:
-        print("[replay] WARNING: --predict_uncertainty set but checkpoint has no UQ head; disabling.")
+    pipeline = model.pipeline
 
     max_chunks = a.max_chunks if a.max_chunks > 0 else None
 
@@ -658,8 +836,14 @@ def main() -> None:
     def _make_on_chunk(suite: str, ep_id: str, cell):
         """Return per-chunk callback; streams one JSONL record per autoregressive chunk."""
         def _on_chunk(chunk_idx: int, frame_now: int, chunk_frame_indices: list,
-                      chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel) -> None:
+                      chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel,
+                      overlap_latent_mse: float | None = None,
+                      full_latent_mse: float | None = None) -> None:
             agg = compute_uq_metrics(chunk_lv, chunk_vel, chunk_epi_lv, chunk_epi_vel)
+            if overlap_latent_mse is not None:
+                agg["epi_overlap_latent_mse"] = overlap_latent_mse
+            if full_latent_mse is not None:
+                agg["epi_full_latent_mse"] = full_latent_mse
             uq_t: dict = {}
             if chunk_lv and args.uq_vis_t_targets:
                 n_ode = len(chunk_lv)
@@ -689,7 +873,8 @@ def main() -> None:
     for suite, ep_id, cell in episode_list:
         p01, p99 = suite_stats[suite]
         latent_gt, action_native, text, native_fps = load_full_episode(
-            a.data_root, suite, ep_id, args, a.split)
+            a.data_root, suite, ep_id, args, a.split,
+            down_sample=a.down_sample, native_fps_default=a.native_fps_default)
 
         # Stride 20 Hz -> target_hz (5 Hz) so spacing matches how the WM was trained.
         stride = max(1, round(native_fps / a.target_hz))
@@ -704,7 +889,8 @@ def main() -> None:
              epi_pred_stack, epi_logvar_by_step, epi_vel_by_step) = replay_episode(
                 model, pipeline, pipeline_cls, args, latent5, action5, text, device,
                 a.num_inference_steps, a.skip, max_chunks,
-                use_uq=use_uq, uq_epi_mode=a.uq_epi_mode,
+                use_uq=use_uq, uq_epi_mode=a.uq_epi_mode, epi_overlap_k=a.epi_overlap_k,
+                overlap_zero_action=a.overlap_zero_action,
                 on_chunk=_make_on_chunk(suite, ep_id, cell))
         except RuntimeError as e:
             print(f"[replay]   skipped: {e}")
@@ -712,6 +898,9 @@ def main() -> None:
 
         gt_vid = decode_per_cam(gt_stack, pipeline, args)
         pred_vid = decode_per_cam(pred_stack, pipeline, args)
+        # Pass-2's own decoded video (e.g. future_overlap's same-range re-prediction).
+        # One extra VAE decode when has_epi -- same cost class as pred_vid's decode above.
+        epi_vid = decode_per_cam(epi_pred_stack, pipeline, args) if epi_pred_stack is not None else None
 
         # ODE step indices closest to each t-target
         uq_indices: list[int] = []
@@ -726,6 +915,9 @@ def main() -> None:
 
         has_epi = a.uq_epi_mode != "none" and epi_pred_stack is not None
         has_vel = bool(vel_by_step and epi_vel_by_step)
+        # alea2 (pass-2's own raw exp(logvar) heatmap) only needs epi_logvar_by_step --
+        # independent of has_vel, unlike the four diff renderers below which also need velocity.
+        has_epi_alea = has_epi and use_uq and bool(epi_logvar_by_step)
         use_compare = (use_uq and logvar_by_step) or has_epi
 
         # Aggregate UQ tensors across all ODE steps for the extra summary row/metrics.
@@ -736,11 +928,26 @@ def main() -> None:
 
         if use_compare:
             # Each t-target is one horizontal row; rows are stacked vertically.
-            # Row layout: GT | Pred | alea [| ltv | epi_var | pdf_diff | kl]
+            # Row layout: GT | Pred | Pred2(*) | alea | alea2(**) | epi_var_signed(***)
+            #             [| ltv | epi_var | pdf_diff | kl]
+            #   (*)   Pred2 = pass-2's own decoded video; present whenever has_epi (no UQ head required).
+            #   (**)  alea2 = pass-2's own raw exp(epi_logvar) heatmap; present when has_epi_alea
+            #         (requires use_uq + epi_logvar_by_step; independent of has_vel, unlike the
+            #         four diff columns below which additionally need velocity).
+            #   (***) epi_var_signed = exp(lv2)-exp(lv1), UNCLAMPED, diverging colormap (warm=pass-2
+            #         MORE uncertain, cool=pass-2 MORE confident) -- see _render_epi_var_signed_video.
+            #         Same gate as alea2; the "epi_var" column below is the original one-directional
+            #         (clamped) version, kept for the degradation-style modes it was designed for.
             rows = []
             for step_idx in uq_indices:
-                row_cols = [gt_vid, pred_vid,
-                            _render_uq_video(logvar_by_step[step_idx], args)]
+                row_cols = [gt_vid, pred_vid]
+                if epi_vid is not None:
+                    row_cols.append(epi_vid)
+                row_cols.append(_render_uq_video(logvar_by_step[step_idx], args))
+                if has_epi_alea:
+                    row_cols.append(_render_uq_video(epi_logvar_by_step[step_idx], args))
+                    row_cols.append(_render_epi_var_signed_video(
+                        logvar_by_step[step_idx], epi_logvar_by_step[step_idx], args))
                 if has_epi and use_uq and has_vel and epi_logvar_by_step:
                     row_cols += [
                         _render_vel_ltv_video(
@@ -757,7 +964,13 @@ def main() -> None:
 
             # Extra row: aggregated (mean across all ODE steps)
             if agg_logvar is not None:
-                agg_cols = [gt_vid, pred_vid, _render_uq_video(agg_logvar, args)]
+                agg_cols = [gt_vid, pred_vid]
+                if epi_vid is not None:
+                    agg_cols.append(epi_vid)
+                agg_cols.append(_render_uq_video(agg_logvar, args))
+                if has_epi_alea and agg_epi_logvar is not None:
+                    agg_cols.append(_render_uq_video(agg_epi_logvar, args))
+                    agg_cols.append(_render_epi_var_signed_video(agg_logvar, agg_epi_logvar, args))
                 if (has_epi and use_uq and agg_vel is not None
                         and agg_epi_logvar is not None and agg_epi_vel is not None):
                     agg_cols += [
@@ -776,8 +989,12 @@ def main() -> None:
                     composite = np.concatenate([composite, h_sep, row], axis=1)
                 write_video(composite, out_root / "compare" / f"{suite}_{ep_id}.mp4", a.video_fps)
             else:
-                # no uq_indices (e.g. uq disabled, epi-only mode)
-                composite = np.concatenate([gt_vid, pred_vid], axis=2)
+                # no uq_indices (e.g. uq disabled, epi-only mode) -- still show pass-2's own
+                # decoded video here since it doesn't require a UQ head, unlike alea/alea2/diffs.
+                fallback_cols = [gt_vid, pred_vid]
+                if epi_vid is not None:
+                    fallback_cols.append(epi_vid)
+                composite = np.concatenate(fallback_cols, axis=2)
                 write_video(composite, out_root / "compare" / f"{suite}_{ep_id}.mp4", a.video_fps)
         else:
             write_video(gt_vid, out_root / "gt" / f"{suite}_{ep_id}.mp4", a.video_fps)

@@ -1,0 +1,85 @@
+# Active, epistemic-UQ-guided pi0.5_libero policy roll-outs in the real
+# LIBERO simulator: at each replanning step, sample several candidate action
+# chunks, score each one's epistemic uncertainty with a UQ-trained world
+# model, and execute only the most uncertain candidate.
+#
+# Run with:
+#   uv run scripts/run_data_collection_active_uq.py \
+#       --config configs/collection/libero_pi05_active_uq.yaml
+#
+# Output format is identical to libero_pi05.yaml / run_data_collection.py
+# (directly consumable by LiberoLatentDataset), plus a sibling
+# <output_root>/<suite>/decision_metrics.jsonl logging every candidate's UQ
+# scores per decision point.
+
+policy:
+  config_name: pi05_libero
+  checkpoint_path: gs://openpi-assets/checkpoints/pi05_libero
+  repo_path: external/openpi
+  pytorch_device: cuda
+
+collection:
+  task_suites: [libero_spatial] # libero_10 libero_goal libero_object libero_spatial
+  # Restricted to task 0 for the smoke test (jobs/run_data_collection_active_uq_smoke_test.sh);
+  # set back to `null` (all tasks) once the smoke test passes and you're
+  # ready to scale up to a full collection run.
+  task_ids: [0] # null
+  trajectories_per_task: 10
+  prompt_override: null
+
+env:
+  resolution: 256
+  resize_size: 224
+  # This checkpoint's WM operates 1:1 with real env steps (trained on
+  # data/libero_uq_2x2_policy_probe, which is native 20Hz with
+  # down_sample=1 -- NOT the 5Hz-strided convention some other LIBERO WM
+  # checkpoints in this repo use). MUST equal (num_frames-1)*skip = 4*1 = 4
+  # (save.num_frames=5, skip=1 hardcoded in run_data_collection_active_uq.py)
+  # so every committed real step has a corresponding Pass-1 predicted frame
+  # to advance the rolled2 self-consistency buffer with.
+  replan_steps: 4
+  num_steps_wait: 10
+  env_max_reward: 1.0
+  seed: 7
+
+save:
+  output_root: data/libero_active_uq_collected
+  write_raw: true
+  svd_path: external/stable-video-diffusion-img2vid
+  device: cuda
+  down_sample: 1
+  raw_fps: 20
+  val_fraction: 0.0
+  num_history: 6
+  num_frames: 5
+
+active_uq:
+  # Number of candidate action chunks sampled from the policy per decision.
+  num_candidates: 4
+  # UQ-trained CrtlWorld checkpoint (predict_uncertainty=True) and the
+  # stat.json of the data it was TRAINED on (not this collection's data) --
+  # see configs/training/libero_wm_uq_2x2_policy_probe_future_hist.py.
+  wm_checkpoint: checkpoints/wm_libero/libero_wm_uq_2x2_policy_probe_future_hist_v0/checkpoint-200000.pt
+  stat_root: data/libero_uq_2x2_policy_probe
+  clip_model_path: external/clip-vit-base-patch32
+  # Denoising steps per candidate-scoring pipeline call (2 calls/decision,
+  # batched across candidates). Training/replay default to 50; start low for
+  # speed and only raise if candidate ranking proves unstable (see plan's
+  # verification section).
+  num_inference_steps: 15
+  # Which compute_uq_metrics() key ranks candidates -- any of:
+  # mean_aleatoric_var, max_aleatoric_var, mean_epi_ltv, max_epi_ltv,
+  # mean_epi_var, mean_pdf_diff, mean_kl. All seven are logged per candidate
+  # in decision_metrics.jsonl regardless of which one is used to select.
+  uq_metric: mean_pdf_diff
+
+  # Candidate-comparison videos, for visually auditing whether uq_metric is
+  # actually picking sensible candidates. Adds ZERO extra world-model
+  # inference (reuses what scoring already computed) but does add VAE-decode
+  # + video-encode cost per saved decision -- leave off for large collection
+  # runs, turn on for small diagnostic runs.
+  viz:
+    enabled: false
+    every_n_decisions: 1        # subsample if enabled (e.g. 4 -> 1 in 4 decisions)
+    max_decisions_per_episode: null   # optional cap; null = no cap
+    fps: 3                      # clips are only num_frames=5 frames long

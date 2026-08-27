@@ -1,0 +1,37 @@
+#!/bin/bash
+#
+#SBATCH --job-name=ctrl-world-train-fo
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:4
+#SBATCH --partition=ailab
+#SBATCH --mem=256G
+#SBATCH --cpus-per-task=8
+#SBATCH --time=48:00:00
+#SBATCH --output=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs/%x-%j.out
+#SBATCH --error=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs/%x-%j.err
+
+echo "SLURM job started at $(date)"
+echo "Node list: $SLURM_NODELIST"
+echo "GPUs: $CUDA_VISIBLE_DEVICES"
+
+# ===== WORKDIR =====
+mkdir -p /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs
+cd /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world
+# ===== ENVIRONMENT =====
+source scripts/setup.bash
+
+# Disable online W&B
+export WANDB_MODE=offline
+
+# ===== TRAIN =====
+# Warm-starts from libero_flow_matching_uq_future_hist_v0/checkpoint-75000.pt
+# (see configs/training/libero_wm_uq_future_overlap.py) and enables
+# p_history_future_overlap=0.5 -- mutually exclusive with p_future_in_history,
+# so this is a fine-tune cycle, not a from-scratch run.
+uv run accelerate launch --num_processes 4 \
+    -m openworld.training.world_model.train_wm \
+    --config configs/training/libero_wm_uq_future_overlap.py
+
+
+echo "SLURM job finished at $(date)"
