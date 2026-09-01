@@ -1,0 +1,118 @@
+# Active, epistemic-UQ-guided rollouts on real DROID hardware, driving the
+# MolmoAct2-DROID policy instead of Pi0.5. Identical to
+# configs/collection/droid_hardware_active_uq.yaml except for the `policy`
+# block and the per-experiment `save.suite_name` -- see that file's header
+# for the world-model / uq_epi_mode pairing table and the v0-checkpoint
+# down_sample caveat.
+#
+# MolmoAct2 runs as a SEPARATE process (its lerobot fork + transformers>=5.4
+# can't share this uv env). On della-gpu it lives under
+#   /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/molmoact/
+# with the checkpoint at   .../molmoact/checkpoints/MolmoAct2-DROID/
+# Start it first, on the same node (uv env: torch 2.7.1 + $MA2/lerobot -e +
+# transformers 5.5.4 -- see the plan file B2 for the `uv venv` / `uv pip` lines):
+#   MA2=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/molmoact
+#   CUDA_VISIBLE_DEVICES=0 $MA2/.venv/bin/python $MA2/serve.py \
+#       --checkpoint $MA2/checkpoints/MolmoAct2-DROID \
+#       --port 9999 --device cuda --warmup_candidates 8
+# wait for "Listening on 127.0.0.1:9999", THEN start this server:
+#   uv run python scripts/run_droid_hardware_active_uq.py \
+#       --config configs/collection/droid_hardware_active_uq_molmoact2.yaml
+#
+# MolmoAct2 returns ABSOLUTE joint-position chunks (norm tag franka_droid), so
+# no OpenPIActionAdapter / Dynamics MLP -- run_droid_hardware_active_uq.py's
+# _ma2_chunk_to_adapted prepends the current measured pose and FK's each row,
+# reproducing the openpi path's (5,7) future_pose / (5,8) wire convention.
+
+policy:
+  # "openpi" (default) or "molmoact2".
+  backend: molmoact2
+  # cuda device for the world model + SVD latent encoder ONLY (MolmoAct2 owns
+  # its own device via serve.py --device).
+  pytorch_device: cuda
+  molmoact2:
+    # serve.py address -- same della-gpu node, loopback (no tunnel).
+    # serve.py loads the checkpoint itself (--checkpoint arg); this client
+    # never sends a path.
+    host: 127.0.0.1
+    port: 9999
+    norm_tag: franka_droid
+    # flow_matching_num_steps for the batched candidate sample. Lower =>
+    # wider spread between candidates (the checkpoint default is 10). If the
+    # Phase-B pilot shows the 7 UQ metrics collapsing across candidates, drop
+    # this to 5-7.
+    num_steps: 10
+    # Steps returned per candidate; must be >= 9 (stride-2 x 5 with a
+    # prepended current row needs index 7). franka_droid's tag gives 15.
+    n_action_steps: 15
+    # obs keys sent to serve.py, in the order MolmoAct2-DROID consumes images.
+    # Mirrors droid/evaluation/molmoact2_wrapper.py::_CAMERA_SERIALS
+    # (hand/wrist first, then the two exteriors). Verify in the Phase-B pilot
+    # by eyeballing candidate_viz pred1 frames; try [left_image, right_image,
+    # wrist_image] if predictions look wrong.
+    camera_order: [wrist_image, left_image, right_image]
+    # Master RNG seed for the batched flow noise (the N candidates differ
+    # regardless; this only makes a run reproducible).
+    seed: 0
+    # Cancels examples/droid/main.py's unconditional `pred_action_chunk[:, -1]
+    # *= 1.5` so the world model conditions on the gripper value the robot
+    # actually executes. Applied to BOTH future_pose and the wire action.
+    gripper_scale: 0.6667
+    timeout_s: 20.0
+  # NOT used for backend=molmoact2 (kept here as a reminder of what the
+  # openpi branch reads): config_name, checkpoint_path, repo_path,
+  # act_adapter_path, gripper_max.
+
+hardware:
+  comms_mode: socket
+  socket_host: 127.0.0.1
+  socket_port: 8765
+  comms_dir: /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/svd_ac_video_model/vidwm/scripts/outputs/planner/hardware/comms
+  external_camera: right
+  poll_interval_s: 0.2
+  obs_timeout_s: 60
+  max_steps: 10000
+  # Start with 1 for the pilot; raise for a real collection run.
+  num_trajectories: 1
+
+active_uq:
+  # H200 headroom -> more candidates sharpens the UQ ranking. The MolmoAct2
+  # flow-sample spread was verified adequate in Phase A (mid-horizon per-joint
+  # std ~0.02-0.1 rad); still gate real collection on the Phase-B pilot's
+  # decision_metrics.jsonl candidate spreads.
+  num_candidates: 8
+  uq_metric: mean_pdf_diff
+  uq_epi_mode: single_history
+  epi_overlap_k: 0
+  num_inference_steps: 15
+  wm_checkpoint: checkpoints/wm_droid/droid_flow_matching_uq_single_hist_v1/checkpoint-110000.pt
+  stat_root: /scratch/gpfs/AM43/yy4041/data/dataset_meta_info
+  clip_model_path: external/clip-vit-base-patch32
+  num_cams: 3
+  height: 192
+  width: 320
+  down_sample: 3
+  # wire_skip/wire_len unchanged: the robot hardcodes `assert
+  # pred_action_chunk.shape == (5, 8)` and wire_len must equal the
+  # checkpoint's num_frames.
+  wire_skip: 2
+  wire_len: 5
+  viz:
+    enabled: true
+    every_n_decisions: 2
+    max_decisions_per_episode: 200
+    fps: 3
+
+save:
+  output_root: data/droid_hardware_active_uq_collected
+  # Per-experiment suite -- keeps MolmoAct2 runs fully separate on disk from
+  # the openpi runs. Rename when wm_checkpoint or uq_epi_mode changes.
+  suite_name: droid_ctrl_world_hardware_molmoact2_single_hist_v1
+  write_raw: true
+  encode_latents: true
+  svd_path: external/stable-video-diffusion-img2vid
+  device: cuda
+  down_sample: 1
+  raw_fps: 15
+  num_history: 6
+  num_frames: 5
