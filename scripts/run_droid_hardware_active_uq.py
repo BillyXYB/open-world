@@ -208,6 +208,7 @@ def _wire_action(adapted: AdaptedActionChunk, idx: list[int]) -> np.ndarray:
 def _pipeline_call(
     wm_model, wm_pipeline_cls, wm_args, action_latent,
     image, history, his_cond_zero, num_frames, num_inference_steps,
+    generator=None,
 ):
     return wm_pipeline_cls.__call__(
         wm_model.pipeline, image=image, text=action_latent,
@@ -220,7 +221,7 @@ def _pipeline_call(
         output_type="latent", return_dict=False,
         frame_level_cond=wm_args.frame_level_cond, his_cond_zero=his_cond_zero,
         flow_map_type=wm_args.flow_map_type, flow_map_loss_type=wm_args.flow_map_loss_type,
-        return_uncertainty=True,
+        return_uncertainty=True, generator=generator,
     )
 
 
@@ -450,6 +451,18 @@ def _rollout_trajectory_hardware(
 
         history_latents, current_latent = _hist_cur(rolled)
 
+        # Shared seed for pass 1 / pass 2: a fresh torch.Generator per call
+        # (not one shared object reused across both __call__s, which would
+        # advance its state between calls and defeat the point) so the two
+        # passes draw identical initial diffusion noise -- isolating the
+        # measured pass1/pass2 divergence to the conditioning difference
+        # instead of ordinary sampling variance. See pipeline_flow_map_ctrl_world.py's
+        # generator-handling fix. Mode-agnostic: applies uniformly to all
+        # uq_epi_mode variants, since it lives at the call sites, not inside
+        # _build_pass2_inputs.
+        noise_seed = torch.Generator().seed()  # random seed, no side effect on global RNG
+        gen1 = torch.Generator(device=device).manual_seed(noise_seed)
+
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             action_latent = wm_model.action_encoder(
                 action_batch, texts, wm_model.tokenizer, wm_model.text_encoder,
@@ -457,7 +470,7 @@ def _rollout_trajectory_hardware(
             _, pred_latents1, logvar_steps1, vel_steps1 = _pipeline_call(
                 wm_model, wm_pipeline_cls, wm_args, action_latent,
                 current_latent, history_latents, wm_args.his_cond_zero,
-                num_frames, num_inference_steps)
+                num_frames, num_inference_steps, generator=gen1)
 
             # Pass-1 always runs first: every mode except "future_overlap"
             # could build pass-2's inputs independently of pass-1's output,
@@ -478,10 +491,11 @@ def _rollout_trajectory_hardware(
                     texts=texts, wm_model=wm_model, wm_args=wm_args, device=device,
                     overlap_zero_action=overlap_zero_action,
                 )
+                gen2 = torch.Generator(device=device).manual_seed(noise_seed)  # same seed as pass 1
                 _, pred_latents2, logvar_steps2, vel_steps2 = _pipeline_call(
                     wm_model, wm_pipeline_cls, wm_args, action_latent2,
                     current2_latent, history2_latents, his_cond_zero2,
-                    num_frames, num_inference_steps)
+                    num_frames, num_inference_steps, generator=gen2)
 
         # Independent step counts: uq_epi_mode=="none" leaves logvar_steps2/
         # vel_steps2 empty, which compute_uq_metrics already handles (it

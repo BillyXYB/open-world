@@ -7,7 +7,7 @@
 #SBATCH --partition=ailab
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
-#SBATCH --time=3:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs/%x-%j.err
 

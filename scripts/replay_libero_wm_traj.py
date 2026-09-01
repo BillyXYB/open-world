@@ -246,6 +246,16 @@ def replay_episode(
         current = rolled[rgb_id[num_history]].unsqueeze(0).to(device)
         action = torch.tensor(action_norm[state_id], dtype=torch.float32).unsqueeze(0).to(device)
 
+        # Shared seed for pass 1 / pass 2: a fresh torch.Generator per call
+        # (not one shared object reused across both __call__s, which would
+        # advance its state between calls and defeat the point) so the two
+        # passes draw identical initial diffusion noise -- isolating the
+        # measured pass1/pass2 divergence to the conditioning difference
+        # instead of ordinary sampling variance. See pipeline_flow_map_ctrl_world.py's
+        # generator-handling fix.
+        noise_seed = torch.Generator().seed()  # random seed, no side effect on global RNG
+        gen1 = torch.Generator(device=device).manual_seed(noise_seed)
+
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             action_latent = model.action_encoder(
                 action, [text], model.tokenizer, model.text_encoder, args.frame_level_cond)
@@ -259,7 +269,7 @@ def replay_episode(
                 output_type="latent", return_dict=False,
                 frame_level_cond=args.frame_level_cond, his_cond_zero=args.his_cond_zero,
                 flow_map_type=args.flow_map_type, flow_map_loss_type=args.flow_map_loss_type,
-                return_uncertainty=use_uq,
+                return_uncertainty=use_uq, generator=gen1,
             )
         if use_uq:
             _, pred_latents, logvar_steps, vel_steps = result
@@ -310,6 +320,7 @@ def replay_episode(
                 current2 = rolled2[rgb_id[num_history]].unsqueeze(0).to(device)
                 his_cond_zero2 = False
 
+            gen2 = torch.Generator(device=device).manual_seed(noise_seed)  # same seed as pass 1
             with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
                 result2 = pipeline_cls.__call__(
                     pipeline, image=current2, text=action_latent2,
@@ -321,7 +332,7 @@ def replay_episode(
                     output_type="latent", return_dict=False,
                     frame_level_cond=args.frame_level_cond, his_cond_zero=his_cond_zero2,
                     flow_map_type=args.flow_map_type, flow_map_loss_type=args.flow_map_loss_type,
-                    return_uncertainty=use_uq,
+                    return_uncertainty=use_uq, generator=gen2,
                 )
             if use_uq:
                 _, pred_latents2, logvar_steps2, vel_steps2 = result2

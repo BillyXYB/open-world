@@ -457,8 +457,13 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
             latents,
         ) # torch.Size([1, 5, 4, 72, 40])
 
-        # NOTE: this make sure latents are from N(0,1), as this is what we assumed in predit_v
-        latents = torch.randn_like(latents)
+        # NOTE: this make sure latents are from N(0,1), as this is what we assumed in predit_v.
+        # Must route through `generator` (not torch.randn_like, which silently drops it and
+        # draws from the global RNG state) -- callers doing a two-pass epistemic-UQ query
+        # (see replay_libero_wm_traj.py / run_droid_hardware_active_uq.py) rely on this to
+        # give pass 1 and pass 2 identical initial noise, isolating the measured divergence
+        # to the conditioning difference instead of ordinary sampling variance.
+        latents = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
         # self.init_noise_sigma = self.scheduler.init_noise_sigma
         
         # 7. Prepare guidance scale
