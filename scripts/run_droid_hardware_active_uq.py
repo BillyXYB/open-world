@@ -64,6 +64,7 @@ from openworld.policies.openpi_action_adapter import (  # noqa: E402
     get_fk_solution,
 )
 from openworld.policies.openpi_loader import load_policy_from_checkpoint  # noqa: E402
+from openworld.policies.molmoact2_client import MolmoAct2Client  # noqa: E402
 from openworld.training.world_model.dataset import _load_stat  # noqa: E402
 from openworld.utils.droid_comms import (  # noqa: E402
     FileChannel,
@@ -163,7 +164,7 @@ def _policy_infer_raw_chunk(policy, obs: dict, external_camera: str, prompt: str
     return np.asarray(policy.infer(element)["actions"])
 
 
-def _generate_candidate(
+def _generate_candidate_openpi(
     policy, action_adapter: OpenPIActionAdapter, obs: dict,
     external_camera: str, prompt: str, wire_skip: int, wire_len: int,
 ) -> tuple[AdaptedActionChunk, np.ndarray, list[int]]:
@@ -186,6 +187,77 @@ def _generate_candidate(
     idx = list(range(0, adapted.env_actions.shape[0], wire_skip))[:wire_len]
     future_pose = adapted.env_actions[idx]  # (wire_len, 7) xyz+euler+gripper
     return adapted, future_pose, idx
+
+
+def _ma2_chunk_to_adapted(
+    ma2_chunk: np.ndarray, joint_position: np.ndarray, gripper_position: float,
+    wire_skip: int, wire_len: int, gripper_scale: float,
+) -> tuple[AdaptedActionChunk, np.ndarray, list[int]]:
+    """MolmoAct2 ``(T>=9, 8)`` absolute joint-position + gripper chunk ->
+    ``AdaptedActionChunk`` in the SAME convention ``_generate_candidate_openpi``
+    produces: row 0 is the current measured state (the robot holds for step 0
+    and the WM checkpoint expects ``future_pose[0]`` to be the current frame),
+    then the model's future steps at stride ``wire_skip``. ``future_pose`` (WM
+    conditioning) and the wire action both derive from the identical
+    stacked-and-sliced rows, so they are mutually consistent by construction.
+
+    ``gripper_scale`` is applied here so the WM sees the same gripper value the
+    robot executes (``examples/droid/main.py`` does ``pred_action_chunk[:,-1] *= 1.5``
+    unconditionally before binarizing).
+    """
+    ma2_chunk = np.asarray(ma2_chunk, dtype=np.float32)
+    joint_position = np.asarray(joint_position, dtype=np.float32).reshape(-1)[:7]
+    cur_row = np.concatenate([joint_position, [float(gripper_position)]]).astype(np.float32)
+    stack = np.concatenate([cur_row[None, :], ma2_chunk[:, :8]], axis=0).astype(np.float32)
+    stack[:, 7] = np.clip(stack[:, 7] * float(gripper_scale), 0.0, 1.0)
+
+    idx = list(range(0, stack.shape[0], wire_skip))[:wire_len]
+    if len(idx) < wire_len:
+        raise ValueError(
+            f"MolmoAct2 chunk too short: stacked {stack.shape[0]} rows, "
+            f"need stride-{wire_skip} x {wire_len}")
+
+    env_actions = np.stack(
+        [_fk_pose(stack[r, :7], float(stack[r, 7])) for r in range(stack.shape[0])], axis=0
+    ).astype(np.float32)  # (T+1, 7) xyz+euler+gripper
+
+    adapted = AdaptedActionChunk(
+        env_actions=env_actions,
+        joint_positions=stack[:, :7].astype(np.float32),
+        gripper_positions=stack[:, 7:8].astype(np.float32),
+    )
+    future_pose = adapted.env_actions[idx]  # (wire_len, 7); row 0 == _fk_pose(current)
+    return adapted, future_pose, idx
+
+
+def _generate_candidates(
+    policy, action_adapter, obs: dict, external_camera: str, prompt: str,
+    wire_skip: int, wire_len: int, num_candidates: int, backend: str,
+) -> list[tuple[AdaptedActionChunk, np.ndarray, list[int]]]:
+    """``num_candidates`` ``(AdaptedActionChunk, future_pose, idx)`` tuples --
+    backend-agnostic shape consumed by the rest of the rollout loop.
+
+    openpi: ``num_candidates`` independent stochastic ``policy.infer`` calls.
+    molmoact2: ONE ``policy.infer_candidates`` round-trip -> ``(N, T>=9, 8)``
+    absolute joint-position chunks; each -> ``_ma2_chunk_to_adapted``.
+    """
+    if backend == "openpi":
+        return [
+            _generate_candidate_openpi(policy, action_adapter, obs, external_camera,
+                                       prompt, wire_skip, wire_len)
+            for _ in range(num_candidates)
+        ]
+    if backend == "molmoact2":
+        chunks = policy.infer_candidates(obs, external_camera, prompt, num_candidates)
+        joint_position = np.asarray(obs["joint_position"], dtype=np.float32)[:7]
+        gripper_position = float(np.asarray(obs["gripper_position"]).reshape(-1)[0])
+        gscale = float(getattr(policy, "gripper_scale", 1.0))
+        return [
+            _ma2_chunk_to_adapted(chunks[i], joint_position, gripper_position,
+                                  wire_skip, wire_len, gscale)
+            for i in range(num_candidates)
+        ]
+    raise ValueError(f"unknown policy backend {backend!r}")
 
 
 def _wire_action(adapted: AdaptedActionChunk, idx: list[int]) -> np.ndarray:
@@ -348,7 +420,7 @@ def _build_pass2_inputs(
 
 
 def _rollout_trajectory_hardware(
-    *, traj_idx: int, policy, action_adapter, wm_model, wm_pipeline_cls, wm_args,
+    *, traj_idx: int, backend: str, policy, action_adapter, wm_model, wm_pipeline_cls, wm_args,
     p01, p99, encoder: LatentEncoder, channel, external_camera: str,
     num_candidates: int, uq_metric: str, uq_epi_mode: str, epi_overlap_k: int,
     overlap_zero_action: bool,
@@ -424,11 +496,9 @@ def _rollout_trajectory_hardware(
         # was trained to handle (see dataset.py's `skip_his = 0` augmentation
         # and, for the old server, uq_data_collection.py's explicit
         # broadcast_to-based flat-history seeding).
-        candidates = [
-            _generate_candidate(policy, action_adapter, obs, external_camera, instruction,
-                                 wire_skip, wire_len)
-            for _ in range(num_candidates)
-        ]
+        candidates = _generate_candidates(
+            policy, action_adapter, obs, external_camera, instruction,
+            wire_skip, wire_len, num_candidates, backend)
         rgb_id = build_frame_ids(frame_now, num_history, num_frames, skip, skip_his)
         hist_ids = [max(idx_, 0) for idx_ in rgb_id[:num_history]]
         hist_rows = np.stack(
@@ -589,22 +659,49 @@ def main() -> None:
 
     device = torch.device(pol_cfg.get("pytorch_device", "cuda") if torch.cuda.is_available() else "cpu")
 
-    logger.info("Loading policy %s from %s", pol_cfg.get("config_name", "pi05_droid"),
-                pol_cfg["checkpoint_path"])
-    policy = load_policy_from_checkpoint(
-        config_name=pol_cfg.get("config_name", "pi05_droid"),
-        checkpoint_path=pol_cfg["checkpoint_path"],
-        repo_path=pol_cfg.get("repo_path", "external/openpi"),
-        default_prompt=None,
-        pytorch_device=pol_cfg.get("pytorch_device", "cuda"),
-    )
+    # policy.backend: "openpi" (default -- Pi0.5 loaded in-process + the
+    # joint-velocity Dynamics MLP adapter) or "molmoact2" (a separate
+    # ~/molmoact2/serve.py process reached over a TCP socket; it returns
+    # absolute joint-position candidate chunks so no adapter is needed).
+    backend = str(pol_cfg.get("backend", "openpi"))
+    if backend not in ("openpi", "molmoact2"):
+        raise SystemExit(f'policy.backend must be "openpi" or "molmoact2", got {backend!r}')
 
-    action_adapter = OpenPIActionAdapter(
-        checkpoint_path=pol_cfg["act_adapter_path"],
-        action_num=15, action_dim=7, hidden_size=512,
-        gripper_max=float(pol_cfg.get("gripper_max", 0.75)),
-        device=pol_cfg.get("pytorch_device", "cuda"),
-    )
+    if backend == "openpi":
+        logger.info("Loading openpi policy %s from %s", pol_cfg.get("config_name", "pi05_droid"),
+                    pol_cfg["checkpoint_path"])
+        policy = load_policy_from_checkpoint(
+            config_name=pol_cfg.get("config_name", "pi05_droid"),
+            checkpoint_path=pol_cfg["checkpoint_path"],
+            repo_path=pol_cfg.get("repo_path", "external/openpi"),
+            default_prompt=None,
+            pytorch_device=pol_cfg.get("pytorch_device", "cuda"),
+        )
+        action_adapter = OpenPIActionAdapter(
+            checkpoint_path=pol_cfg["act_adapter_path"],
+            action_num=15, action_dim=7, hidden_size=512,
+            gripper_max=float(pol_cfg.get("gripper_max", 0.75)),
+            device=pol_cfg.get("pytorch_device", "cuda"),
+        )
+    else:  # molmoact2
+        ma2_cfg = pol_cfg.get("molmoact2", {})
+        logger.info("Connecting to MolmoAct2 server at %s:%s",
+                    ma2_cfg.get("host", "127.0.0.1"), ma2_cfg.get("port", 9999))
+        policy = MolmoAct2Client(
+            host=ma2_cfg.get("host", "127.0.0.1"),
+            port=int(ma2_cfg.get("port", 9999)),
+            norm_tag=ma2_cfg.get("norm_tag", "franka_droid"),
+            num_steps=ma2_cfg.get("num_steps", 10),
+            n_action_steps=int(ma2_cfg.get("n_action_steps", 15)),
+            camera_order=ma2_cfg.get("camera_order",
+                                     ["wrist_image", "left_image", "right_image"]),
+            seed=int(ma2_cfg.get("seed", 0)),
+            gripper_scale=float(ma2_cfg.get("gripper_scale", 1.0 / 1.5)),
+            timeout_s=float(ma2_cfg.get("timeout_s", 20.0)),
+        )
+        policy.connect()  # fail fast if serve.py is not running
+        logger.info("MolmoAct2 server connected.")
+        action_adapter = None
 
     num_candidates = int(uq_cfg.get("num_candidates", 4))
     uq_metric = uq_cfg.get("uq_metric", "mean_pdf_diff")
@@ -710,7 +807,7 @@ def main() -> None:
         viz_dir = output_root / suite_name / "candidate_viz" / f"{traj_idx:06d}"
         logger.info("[traj %d] starting rollout", traj_idx)
         payload, decision_log, instruction = _rollout_trajectory_hardware(
-            traj_idx=traj_idx, policy=policy, action_adapter=action_adapter,
+            traj_idx=traj_idx, backend=backend, policy=policy, action_adapter=action_adapter,
             wm_model=wm_model, wm_pipeline_cls=wm_pipeline_cls, wm_args=wm_args,
             p01=p01, p99=p99, encoder=encoder, channel=channel,
             external_camera=external_camera, num_candidates=num_candidates,
@@ -732,6 +829,7 @@ def main() -> None:
             joint_position=payload["joint_position"], language=instruction,
             fps=raw_fps, down_sample=export_down_sample, write_raw=write_raw,
             extra_annotation={
+                "policy_backend": backend,
                 "num_candidates": num_candidates, "uq_metric": uq_metric,
                 "uq_epi_mode": uq_epi_mode,
                 "wm_checkpoint": str(wm_checkpoint), "num_decisions": len(decision_log),
