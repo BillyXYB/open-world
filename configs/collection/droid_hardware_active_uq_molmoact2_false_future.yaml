@@ -58,11 +58,9 @@ policy:
     # (margin of 2).
     n_action_steps: 15
     # obs keys sent to serve.py, in the order MolmoAct2-DROID consumes images.
-    # Mirrors droid/evaluation/molmoact2_wrapper.py::_CAMERA_SERIALS
-    # (hand/wrist first, then the two exteriors). Verify in the pilot by
-    # eyeballing candidate_viz pred1 frames; try [left_image, right_image,
-    # wrist_image] if predictions look wrong.
-    camera_order: [wrist_image, left_image, right_image]
+    # Matches the known-working standalone path (molmoact2_wrapper.py:
+    # [hand, varied_camera_1=38872458=right, varied_camera_2=31177322=left]).
+    camera_order: [wrist_image, right_image, left_image]
     # Master RNG seed for the batched flow noise (the N candidates differ
     # regardless; this only makes a run reproducible).
     seed: 0
@@ -71,6 +69,11 @@ policy:
     # actually executes. Applied to BOTH future_pose and the wire action.
     gripper_scale: 0.6667
     timeout_s: 20.0
+    # >0 => client logs image shapes/means + the returned chunk's per-step
+    # joint drift and saves a side-by-side PNG for the first N decisions.
+    # Set back to null / 0 after the first pilot.
+    debug_dump_dir: data/droid_hardware_active_uq_collected/ma2_debug
+    debug_dump_n: 5
   # NOT used for backend=molmoact2 (kept here as a reminder of what the
   # openpi branch reads): config_name, checkpoint_path, repo_path,
   # act_adapter_path, gripper_max.

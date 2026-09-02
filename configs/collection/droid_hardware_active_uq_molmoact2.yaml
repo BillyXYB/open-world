@@ -14,7 +14,12 @@
 #   MA2=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/molmoact
 #   CUDA_VISIBLE_DEVICES=0 $MA2/.venv/bin/python $MA2/serve.py \
 #       --checkpoint $MA2/checkpoints/MolmoAct2-DROID \
-#       --port 9999 --device cuda --warmup_candidates 8
+#       --port 9999 --device cuda --warmup_candidates 2,4
+# --warmup_candidates MUST include this run's active_uq.num_candidates
+# (2 for policy_only here, 4 for droid_hardware_active_uq_molmoact2_false_future).
+# The action-flow CUDA graph is captured per n_candidates; a value that isn't
+# warmed silently drops that run to the ~4x-slower eager path. The list form
+# warms both so one server serves either config.
 # wait for "Listening on 127.0.0.1:9999", THEN start this server:
 #   uv run python scripts/run_droid_hardware_active_uq.py \
 #       --config configs/collection/droid_hardware_active_uq_molmoact2.yaml
@@ -47,11 +52,13 @@ policy:
     # (margin of 2).
     n_action_steps: 15
     # obs keys sent to serve.py, in the order MolmoAct2-DROID consumes images.
-    # Mirrors droid/evaluation/molmoact2_wrapper.py::_CAMERA_SERIALS
-    # (hand/wrist first, then the two exteriors). Verify in the Phase-B pilot
-    # by eyeballing candidate_viz pred1 frames; try [left_image, right_image,
-    # wrist_image] if predictions look wrong.
-    camera_order: [wrist_image, left_image, right_image]
+    # Matches the known-working standalone path
+    # (droid/evaluation/molmoact2_wrapper.py::_CAMERA_SERIALS = [hand_camera_id,
+    # varied_camera_1_id=38872458=right, varied_camera_2_id=31177322=left]).
+    # NB the checkpoint README uses [exterior_1, wrist]; in-process A/B showed
+    # camera order/count is a minor (<15%) effect either way -- confirm live
+    # with debug_dump_n below.
+    camera_order: [wrist_image, right_image, left_image]
     # Master RNG seed for the batched flow noise (the N candidates differ
     # regardless; this only makes a run reproducible).
     seed: 0
@@ -60,6 +67,13 @@ policy:
     # actually executes. Applied to BOTH future_pose and the wire action.
     gripper_scale: 0.6667
     timeout_s: 20.0
+    # >0 => the client logs (image shapes/means, the returned chunk's per-step
+    # joint drift) and saves a side-by-side PNG for the first N decisions, so
+    # the first live run confirms MolmoAct2 is getting good frames and
+    # producing real motion. Set debug_dump_dir: null / debug_dump_n: 0 after
+    # the first pilot run.
+    debug_dump_dir: data/droid_hardware_active_uq_collected/ma2_debug
+    debug_dump_n: 5
   # NOT used for backend=molmoact2 (kept here as a reminder of what the
   # openpi branch reads): config_name, checkpoint_path, repo_path,
   # act_adapter_path, gripper_max.
@@ -86,11 +100,13 @@ active_uq:
   # stat_root become optional and are ignored when true. Set back to false
   # (the default) for real active-UQ collection.
   policy_only: true # false
-  # H200 headroom -> more candidates sharpens the UQ ranking. The MolmoAct2
-  # flow-sample spread was verified adequate in Phase A (mid-horizon per-joint
-  # std ~0.02-0.1 rad); still gate real collection on the Phase-B pilot's
-  # decision_metrics.jsonl candidate spreads.
-  num_candidates: 4
+  # policy_only only uses candidate 0, so keep this at 2 (the minimum
+  # infer_candidate_chunks accepts) -> the server's action-flow CUDA graph is
+  # captured at n=2 and each replan is ~0.17s instead of ~0.6-1s eager, which
+  # dominates the robot's duty cycle. For real UQ (policy_only: false) raise
+  # this back to 4-8 -- more candidates sharpen the ranking -- and set
+  # serve.py --warmup_candidates to match.
+  num_candidates: 2
   uq_metric: mean_pdf_diff
   uq_epi_mode: single_history
   epi_overlap_k: 0

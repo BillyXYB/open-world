@@ -194,12 +194,16 @@ def _ma2_chunk_to_adapted(
     wire_skip: int, wire_len: int, gripper_scale: float,
 ) -> tuple[AdaptedActionChunk, np.ndarray, list[int]]:
     """MolmoAct2 ``(T>=9, 8)`` absolute joint-position + gripper chunk ->
-    ``AdaptedActionChunk`` in the SAME convention ``_generate_candidate_openpi``
-    produces: row 0 is the current measured state (the robot holds for step 0
-    and the WM checkpoint expects ``future_pose[0]`` to be the current frame),
-    then the model's future steps at stride ``wire_skip``. ``future_pose`` (WM
-    conditioning) and the wire action both derive from the identical
-    stacked-and-sliced rows, so they are mutually consistent by construction.
+    ``AdaptedActionChunk``.
+
+    Two consumers, deliberately NOT the same rows:
+      * ``future_pose`` (WM conditioning) -- the checkpoint expects frame 0 to
+        be the CURRENT measured pose, then the model's future at stride
+        ``wire_skip``; built from the current-prepended stack's ``env_actions``.
+      * the wire action (``_wire_action`` -> ``adapted.joint_positions``) -- the
+        robot's real per-tick joint targets, ``ma2[0..]`` DENSE with NO
+        prepended no-op tick (unlike openpi, whose adapter genuinely produces
+        the current pose as its step 0).
 
     ``gripper_scale`` is applied here so the WM sees the same gripper value the
     robot executes (``examples/droid/main.py`` does ``pred_action_chunk[:,-1] *= 1.5``
@@ -207,24 +211,31 @@ def _ma2_chunk_to_adapted(
     """
     ma2_chunk = np.asarray(ma2_chunk, dtype=np.float32)
     joint_position = np.asarray(joint_position, dtype=np.float32).reshape(-1)[:7]
-    cur_row = np.concatenate([joint_position, [float(gripper_position)]]).astype(np.float32)
-    stack = np.concatenate([cur_row[None, :], ma2_chunk[:, :8]], axis=0).astype(np.float32)
-    stack[:, 7] = np.clip(stack[:, 7] * float(gripper_scale), 0.0, 1.0)
 
+    # dense per-tick model targets, gripper-scaled -- what the robot executes
+    ma2 = ma2_chunk[:, :8].astype(np.float32).copy()
+    ma2[:, 7] = np.clip(ma2[:, 7] * float(gripper_scale), 0.0, 1.0)
+
+    # current-prepended stack, used ONLY for the WM's future_pose conditioning.
+    # cur_row's gripper is scaled the same way (matches the pre-refactor
+    # behaviour of scaling the whole stack -- keeps future_pose byte-identical).
+    cur_row = np.concatenate(
+        [joint_position, [np.clip(float(gripper_position) * float(gripper_scale), 0.0, 1.0)]]
+    ).astype(np.float32)
+    stack = np.concatenate([cur_row[None, :], ma2], axis=0)  # (T+1, 8)
     idx = list(range(0, stack.shape[0], wire_skip))[:wire_len]
     if len(idx) < wire_len:
         raise ValueError(
             f"MolmoAct2 chunk too short: stacked {stack.shape[0]} rows, "
             f"need stride-{wire_skip} x {wire_len}")
-
-    env_actions = np.stack(
+    stack_env = np.stack(
         [_fk_pose(stack[r, :7], float(stack[r, 7])) for r in range(stack.shape[0])], axis=0
     ).astype(np.float32)  # (T+1, 7) xyz+euler+gripper
 
     adapted = AdaptedActionChunk(
-        env_actions=env_actions,
-        joint_positions=stack[:, :7].astype(np.float32),
-        gripper_positions=stack[:, 7:8].astype(np.float32),
+        env_actions=stack_env,                              # (T+1, 7) -- indexed by idx for future_pose
+        joint_positions=ma2[:, :7].astype(np.float32),      # (T, 7)   -- dense, NO current-prepend
+        gripper_positions=ma2[:, 7:8].astype(np.float32),   # (T, 1)
     )
     future_pose = adapted.env_actions[idx]  # (wire_len, 7); row 0 == _fk_pose(current)
     return adapted, future_pose, idx
@@ -782,10 +793,12 @@ def main() -> None:
             num_steps=ma2_cfg.get("num_steps", 10),
             n_action_steps=int(ma2_cfg.get("n_action_steps", 15)),
             camera_order=ma2_cfg.get("camera_order",
-                                     ["wrist_image", "left_image", "right_image"]),
+                                     ["wrist_image", "right_image", "left_image"]),
             seed=int(ma2_cfg.get("seed", 0)),
             gripper_scale=float(ma2_cfg.get("gripper_scale", 1.0 / 1.5)),
             timeout_s=float(ma2_cfg.get("timeout_s", 20.0)),
+            debug_dump_dir=ma2_cfg.get("debug_dump_dir"),
+            debug_dump_n=int(ma2_cfg.get("debug_dump_n", 0)),
         )
         policy.connect()  # fail fast if serve.py is not running
         logger.info("MolmoAct2 server connected.")
