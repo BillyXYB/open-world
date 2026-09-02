@@ -25,6 +25,7 @@ import pathlib
 import pickle
 import socket
 import struct
+import time
 from typing import Optional
 
 import numpy as np
@@ -77,6 +78,7 @@ class MolmoAct2Client:
         camera_order: Optional[list[str]] = None,
         seed: int = 0,
         gripper_scale: float = 1.0,
+        image_size: Optional[int] = None,
         timeout_s: float = 20.0,
         debug_dump_dir: Optional[str] = None,
         debug_dump_n: int = 0,
@@ -89,8 +91,14 @@ class MolmoAct2Client:
         self.camera_order = list(camera_order or _DEFAULT_CAMERA_ORDER)
         self.seed = int(seed)
         self.gripper_scale = float(gripper_scale)
+        # resize each frame to image_size x image_size before sending: matches
+        # eval_molmoact2.py's RobotEnv(resolution=(480,480)) AND cuts the
+        # client->serve.py payload ~7x (1280x720 -> 480). Quality is a wash
+        # (test_c6); latency is not. None = send native.
+        self.image_size = int(image_size) if image_size else None
         self.timeout_s = float(timeout_s)
         self._conn: Optional[socket.socket] = None
+        self._last_rt_s = 0.0
         # opt-in: for the first `debug_dump_n` calls, log what we send + what
         # comes back, and save a side-by-side PNG of the images. Confirms the
         # live model is getting good frames and producing real chunks.
@@ -127,7 +135,13 @@ class MolmoAct2Client:
             img = np.ascontiguousarray(np.asarray(obs[key], dtype=np.uint8))
             if img.ndim == 3 and img.shape[-1] == 4:
                 img = img[..., :3]
-            images.append(img)
+            if self.image_size and (img.shape[0] != self.image_size or img.shape[1] != self.image_size):
+                from PIL import Image
+                img = np.asarray(
+                    Image.fromarray(np.ascontiguousarray(img)).resize(
+                        (self.image_size, self.image_size), Image.BILINEAR),
+                    dtype=np.uint8)
+            images.append(np.ascontiguousarray(img))
 
         joint = np.asarray(obs["joint_position"], dtype=np.float32).reshape(-1)[:7]
         grip = float(np.asarray(obs["gripper_position"], dtype=np.float32).reshape(-1)[0])
@@ -182,6 +196,8 @@ class MolmoAct2Client:
             raise ValueError("MolmoAct2 candidate mode needs num_candidates >= 2")
 
         msg = self._build_msg(obs, prompt, int(num_candidates))
+        payload_mb = sum(np.asarray(i).nbytes for i in msg["images"]) / 1e6
+        t0 = time.perf_counter()
         try:
             _send_msg(self._conn, msg)
             out = _recv_msg(self._conn)
@@ -189,6 +205,10 @@ class MolmoAct2Client:
             self._reconnect()
             _send_msg(self._conn, msg)
             out = _recv_msg(self._conn)
+        self._last_rt_s = time.perf_counter() - t0
+        if self._call < max(self._dump_n, 20):
+            logger.info("[ma2] infer_candidates round-trip %.2fs  (images %.1f MB, n=%d)",
+                        self._last_rt_s, payload_mb, int(num_candidates))
 
         out = np.asarray(out, dtype=np.float32)
         if out.ndim != 3 or out.shape[0] != int(num_candidates) or out.shape[-1] != 8:

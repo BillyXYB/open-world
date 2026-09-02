@@ -796,6 +796,7 @@ def main() -> None:
                                      ["wrist_image", "right_image", "left_image"]),
             seed=int(ma2_cfg.get("seed", 0)),
             gripper_scale=float(ma2_cfg.get("gripper_scale", 1.0 / 1.5)),
+            image_size=ma2_cfg.get("image_size"),
             timeout_s=float(ma2_cfg.get("timeout_s", 20.0)),
             debug_dump_dir=ma2_cfg.get("debug_dump_dir"),
             debug_dump_n=int(ma2_cfg.get("debug_dump_n", 0)),

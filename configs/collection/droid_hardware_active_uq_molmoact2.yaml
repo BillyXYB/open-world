@@ -66,6 +66,9 @@ policy:
     # *= 1.5` so the world model conditions on the gripper value the robot
     # actually executes. Applied to BOTH future_pose and the wire action.
     gripper_scale: 0.6667
+    # resize frames to NxN before send: matches eval_molmoact2 (480) and cuts
+    # the client->serve.py payload ~7x. null = native. quality is a wash.
+    image_size: 480
     timeout_s: 20.0
     # >0 => the client logs (image shapes/means, the returned chunk's per-step
     # joint drift) and saves a side-by-side PNG for the first N decisions, so
