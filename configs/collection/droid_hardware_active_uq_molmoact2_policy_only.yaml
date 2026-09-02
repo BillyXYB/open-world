@@ -1,0 +1,166 @@
+# Active, epistemic-UQ-guided rollouts on real DROID hardware, driving the
+# MolmoAct2-DROID policy, scored against the droid_flow_matching_uq_false_future_v1
+# world model. Identical to configs/collection/droid_hardware_active_uq_molmoact2.yaml
+# except for wm_checkpoint/uq_epi_mode/overlap_zero_action/suite_name below --
+# see that file's header for the MolmoAct2 serve.py startup sequence (start
+# serve.py FIRST, wait for "Listening on 127.0.0.1:9999", THEN this server).
+#
+# ==============================================================================
+# WHY overlap_zero_action: true (read before pointing wm_checkpoint at a
+# different future_overlap-family checkpoint):
+# droid_flow_matching_uq_false_future_v1 (configs/training/droid_wm_uq_false_future_v1.py)
+# builds on droid_flow_matching_uq_future_overlap_v1 by additionally training
+# with p_false_future=0.5 (the overlap "peek" is sometimes a MISMATCHED future
+# from a different episode, breaking the "peek == answer" tautology v1's
+# replay eval showed collapsing to near-uniform overconfidence) and
+# zero_overlap_action=True (the overlap slot's action conditioning is zeroed,
+# so confidence in the peek must come from visual/temporal content, not an
+# action<->frame consistency shortcut). Because (2) changes what the overlap
+# slot's action conditioning looks like relative to v1, evaluating THIS
+# checkpoint REQUIRES overlap_zero_action: true below to match training --
+# v1 (or any earlier future_overlap checkpoint) must NOT set it (they were
+# trained with a real action at the overlap slot). See that training config's
+# module docstring and config.py's zero_overlap_action docstring for the
+# full explanation. An offline replay eval already exists at
+# checkpoints/wm_droid/droid_flow_matching_uq_false_future_v1/replay_epi_false_future/
+# (run via jobs/replay_droid_wm_traj_epi_false_future.sh) -- worth checking
+# before/alongside this hardware pilot's decision_metrics.jsonl.
+#
+# Regardless of which checkpoint/mode you use: treat first runs on any new
+# checkpoint/uq_epi_mode PAIRING as a pilot -- inspect decision_metrics.jsonl's
+# candidate spreads (do the 7 logged UQ metrics actually discriminate between
+# candidates, or collapse to near-identical values?) before trusting the
+# collected data. Given v1's own history here, this applies with extra force
+# -- an augmentation that looked reasonable on paper already produced
+# degenerate UQ output once for this exact checkpoint family.
+# ==============================================================================
+
+policy:
+  # "openpi" (default) or "molmoact2".
+  backend: molmoact2
+  # cuda device for the world model + SVD latent encoder ONLY (MolmoAct2 owns
+  # its own device via serve.py --device).
+  pytorch_device: cuda
+  molmoact2:
+    # serve.py address -- same della-ani node, loopback (no tunnel).
+    # serve.py loads the checkpoint itself (--checkpoint arg); this client
+    # never sends a path.
+    host: 127.0.0.1
+    port: 9999
+    norm_tag: franka_droid
+    # flow_matching_num_steps for the batched candidate sample. Lower =>
+    # wider spread between candidates (the checkpoint default is 10). If the
+    # pilot shows the 7 UQ metrics collapsing across candidates, drop this to
+    # 5-7.
+    num_steps: 10
+    # Steps returned per candidate; must be >= 13 (stride-3 x 5 with a
+    # prepended current row needs index 12). franka_droid's tag gives 15
+    # (margin of 2).
+    n_action_steps: 15
+    # obs keys sent to serve.py, in the order MolmoAct2-DROID consumes images.
+    # Mirrors droid/evaluation/molmoact2_wrapper.py::_CAMERA_SERIALS
+    # (hand/wrist first, then the two exteriors). Verify in the pilot by
+    # eyeballing candidate_viz pred1 frames; try [left_image, right_image,
+    # wrist_image] if predictions look wrong.
+    camera_order: [wrist_image, left_image, right_image]
+    # Master RNG seed for the batched flow noise (the N candidates differ
+    # regardless; this only makes a run reproducible).
+    seed: 0
+    # Cancels examples/droid/main.py's unconditional `pred_action_chunk[:, -1]
+    # *= 1.5` so the world model conditions on the gripper value the robot
+    # actually executes. Applied to BOTH future_pose and the wire action.
+    gripper_scale: 0.6667
+    timeout_s: 20.0
+  # NOT used for backend=molmoact2 (kept here as a reminder of what the
+  # openpi branch reads): config_name, checkpoint_path, repo_path,
+  # act_adapter_path, gripper_max.
+
+hardware:
+  comms_mode: socket
+  socket_host: 127.0.0.1
+  socket_port: 8765
+  comms_dir: /scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/svd_ac_video_model/vidwm/scripts/outputs/planner/hardware/comms
+  external_camera: right
+  poll_interval_s: 0.2
+  obs_timeout_s: 60
+  max_steps: 10000
+  # Start with 1 for the pilot; raise for a real collection run.
+  num_trajectories: 2
+
+active_uq:
+  # Testing-only bypass: skips loading the world model checkpoint entirely
+  # and, every round trip, sends the FIRST proposed policy candidate as-is
+  # (no WM scoring/UQ metrics/candidate-comparison viz). Candidates are
+  # still generated normally (so the policy + comms/execution pipeline get
+  # exercised end-to-end) -- this isolates "does the policy + robot
+  # execution work" from "does UQ-guided action selection work" -- matching
+  # the same starting point droid_hardware_active_uq_molmoact2.yaml used for
+  # its own first pilot. Set to false once that's confirmed working and
+  # you're ready to test the false_future/future_overlap UQ pairing itself.
+  policy_only: true
+  # H200 headroom -> more candidates sharpens the UQ ranking. Still gate real
+  # collection on this pairing's own decision_metrics.jsonl candidate spreads
+  # -- do not assume the single_hist_v1 config's spread check transfers.
+  num_candidates: 4
+  uq_metric: mean_pdf_diff
+  uq_epi_mode: future_overlap
+  # How many of each candidate's own future frames to splice into pass-2's
+  # history. 0 = max (num_frames - 1). The sibling job
+  # jobs/replay_droid_wm_traj_epi_overlap_k_sweep.sh sweeps this explicitly
+  # if the max setting's UQ signal looks degenerate.
+  epi_overlap_k: 0
+  # REQUIRED true for this checkpoint -- see the KNOWN CAVEAT header above.
+  # Do not set true for droid_flow_matching_uq_future_overlap_v1 or earlier.
+  overlap_zero_action: true
+  num_inference_steps: 15
+  # v1's replay showed the v0 collapse issue partially persisting even with
+  # the false-future fix (per the training config's own docstring framing --
+  # this is presented as a further mitigation, not a guaranteed fix); this is
+  # exactly what this hardware pilot's decision_metrics.jsonl spread check
+  # needs to confirm one way or the other. Latest available step
+  # (checkpoint-20000/40000/60000/80000/100000.pt also exist on disk under
+  # the same directory).
+  wm_checkpoint: checkpoints/wm_droid/droid_flow_matching_uq_false_future_v1/checkpoint-120000.pt
+  stat_root: /scratch/gpfs/AM43/yy4041/data/dataset_meta_info
+  clip_model_path: external/clip-vit-base-patch32
+  num_cams: 3
+  height: 192
+  width: 320
+  down_sample: 3
+  # wire_skip/wire_len now serve TWO purposes:
+  #  1. WM-scoring stride: future_pose = the chunk's rows at [0, wire_skip,
+  #     2*wire_skip, ...][:wire_len] -- wire_skip=3 matches the checkpoint's
+  #     dominant training-time frame spacing (down_sample=3 x frame_skip=1;
+  #     see configs/training/droid_wm_uq*.py). wire_len must equal the
+  #     checkpoint's num_frames.
+  #  2. Save-sampling stride: the robot's obs-send window
+  #     (examples/droid/main.py) is repointed to sample every wire_skip raw
+  #     ticks across the whole round-trip period instead of the last 5
+  #     consecutive ticks, so the saved trajectory stays ~wire_skip-spaced
+  #     (~5Hz here) regardless of how long the round-trip period gets.
+  # The ROBOT's wire/execution action is NOT this strided slice anymore --
+  # it's the dense, un-strided chunk prefix up to
+  # wire_skip*(wire_len-1)+1 raw ticks (see run_droid_hardware_active_uq.py's
+  # _wire_action); the robot no longer hardcodes a (5, 8) shape assert.
+  wire_skip: 3
+  wire_len: 5
+  viz:
+    enabled: true
+    every_n_decisions: 2
+    max_decisions_per_episode: 200
+    fps: 3
+
+save:
+  output_root: data/droid_hardware_active_uq_collected
+  # Per-experiment suite -- keeps this pairing fully separate on disk from
+  # both the openpi runs and the other MolmoAct2 (single_hist_v1) pairing.
+  # Rename when wm_checkpoint or uq_epi_mode changes again.
+  suite_name: droid_ctrl_world_hardware_molmoact2_policy_only
+  write_raw: true
+  encode_latents: true
+  svd_path: external/stable-video-diffusion-img2vid
+  device: cuda
+  down_sample: 1
+  raw_fps: 15
+  num_history: 6
+  num_frames: 5

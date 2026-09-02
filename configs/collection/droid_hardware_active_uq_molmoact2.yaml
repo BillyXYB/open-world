@@ -42,8 +42,9 @@ policy:
     # Phase-B pilot shows the 7 UQ metrics collapsing across candidates, drop
     # this to 5-7.
     num_steps: 10
-    # Steps returned per candidate; must be >= 9 (stride-2 x 5 with a
-    # prepended current row needs index 7). franka_droid's tag gives 15.
+    # Steps returned per candidate; must be >= 13 (stride-3 x 5 with a
+    # prepended current row needs index 12). franka_droid's tag gives 15
+    # (margin of 2).
     n_action_steps: 15
     # obs keys sent to serve.py, in the order MolmoAct2-DROID consumes images.
     # Mirrors droid/evaluation/molmoact2_wrapper.py::_CAMERA_SERIALS
@@ -76,11 +77,20 @@ hardware:
   num_trajectories: 1
 
 active_uq:
+  # Testing-only bypass: skips loading the world model checkpoint entirely
+  # and, every round trip, sends the FIRST proposed policy candidate as-is
+  # (no WM scoring/UQ metrics/candidate-comparison viz). Candidates are
+  # still generated normally (so the policy + comms/execution pipeline get
+  # exercised end-to-end) -- this isolates "does the policy + robot
+  # execution work" from "does UQ-guided action selection work". wm_checkpoint/
+  # stat_root become optional and are ignored when true. Set back to false
+  # (the default) for real active-UQ collection.
+  policy_only: true # false
   # H200 headroom -> more candidates sharpens the UQ ranking. The MolmoAct2
   # flow-sample spread was verified adequate in Phase A (mid-horizon per-joint
   # std ~0.02-0.1 rad); still gate real collection on the Phase-B pilot's
   # decision_metrics.jsonl candidate spreads.
-  num_candidates: 8
+  num_candidates: 4
   uq_metric: mean_pdf_diff
   uq_epi_mode: single_history
   epi_overlap_k: 0
@@ -92,10 +102,22 @@ active_uq:
   height: 192
   width: 320
   down_sample: 3
-  # wire_skip/wire_len unchanged: the robot hardcodes `assert
-  # pred_action_chunk.shape == (5, 8)` and wire_len must equal the
-  # checkpoint's num_frames.
-  wire_skip: 2
+  # wire_skip/wire_len now serve TWO purposes:
+  #  1. WM-scoring stride: future_pose = the chunk's rows at [0, wire_skip,
+  #     2*wire_skip, ...][:wire_len] -- wire_skip=3 matches the checkpoint's
+  #     dominant training-time frame spacing (down_sample=3 x frame_skip=1;
+  #     see configs/training/droid_wm_uq*.py). wire_len must equal the
+  #     checkpoint's num_frames.
+  #  2. Save-sampling stride: the robot's obs-send window
+  #     (examples/droid/main.py) is repointed to sample every wire_skip raw
+  #     ticks across the whole round-trip period instead of the last 5
+  #     consecutive ticks, so the saved trajectory stays ~wire_skip-spaced
+  #     (~5Hz here) regardless of how long the round-trip period gets.
+  # The ROBOT's wire/execution action is NOT this strided slice anymore --
+  # it's the dense, un-strided chunk prefix up to
+  # wire_skip*(wire_len-1)+1 raw ticks (see run_droid_hardware_active_uq.py's
+  # _wire_action); the robot no longer hardcodes a (5, 8) shape assert.
+  wire_skip: 3
   wire_len: 5
   viz:
     enabled: true

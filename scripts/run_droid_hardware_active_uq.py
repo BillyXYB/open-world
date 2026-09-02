@@ -260,13 +260,20 @@ def _generate_candidates(
     raise ValueError(f"unknown policy backend {backend!r}")
 
 
-def _wire_action(adapted: AdaptedActionChunk, idx: list[int]) -> np.ndarray:
-    """(wire_len, 8) joint_positions + gripper -- the exact wire format
+def _wire_action(adapted: AdaptedActionChunk, exec_len: int) -> np.ndarray:
+    """(exec_len, 8) joint_positions + gripper -- the DENSE, un-strided
+    prefix of the chunk (every raw tick, real MolmoAct2/adapted-openpi
+    predictions, no interpolation) up to the last raw tick the WM actually
+    scored (``exec_len = idx[-1] + 1`` at the call site). This is what
     ``uq_data_collection.py::send_action``'s production ``action_key=
     "joint_pos"`` path sends (future joint positions, NOT cartesian
-    velocity, despite the root CLAUDE.md's description)."""
-    joint_pos = adapted.joint_positions[idx]
-    grip_pos = adapted.gripper_positions[idx]
+    velocity, despite the root CLAUDE.md's description) -- previously a
+    ``wire_skip``-strided slice of length ``wire_len``; now the robot
+    executes the real per-tick trajectory natively at 15Hz instead of
+    snapping through strided waypoints at native rate (which commanded
+    roughly wire_skip x the intended joint velocity)."""
+    joint_pos = adapted.joint_positions[:exec_len]
+    grip_pos = adapted.gripper_positions[:exec_len]
     return np.concatenate([joint_pos, grip_pos], axis=-1).astype(np.float32)
 
 
@@ -430,16 +437,23 @@ def _rollout_trajectory_hardware(
     obs_timeout_s: float, poll_interval_s: float,
     viz_enabled: bool, viz_every_n_decisions: int, viz_max_decisions: Optional[int],
     viz_fps: int, viz_dir,
+    num_cams: int,
+    policy_only: bool = False,
 ) -> tuple[dict, list[dict], str]:
     """Run one trajectory to completion (robot-signalled done or
     ``max_steps`` round-trips). Returns (buffered-episode payload,
-    decision_log, instruction text)."""
-    num_history, num_frames = wm_args.num_history, wm_args.num_frames
-    skip, skip_his = 1, 4  # round-trip units; see module-level rationale in the config comments
-    per_cam_h, latent_w = wm_args.height // 8, wm_args.width // 8
-    num_cams = wm_args.num_cams
-    device = next(wm_model.parameters()).device
+    decision_log, instruction text).
 
+    ``policy_only=True`` bypasses the world model entirely (``wm_model``/
+    ``wm_pipeline_cls``/``wm_args``/``p01``/``p99`` may all be ``None``):
+    MolmoAct2/openpi candidates are still generated every round trip (so the
+    policy + comms/execution pipeline still get exercised end-to-end), but
+    the FIRST proposed candidate is sent as-is, no WM scoring/UQ metrics/
+    candidate-comparison viz. See the per-round-trip if/else below.
+    """
+    # num_cams is a plain param now (not wm_args.num_cams) since the
+    # save-buffer accumulation loop below needs it regardless of whether the
+    # WM (and therefore wm_args) is loaded at all.
     rolled: list[torch.Tensor] = []
     # Only "iterative" mode needs a self-predicted history buffer; other
     # modes derive pass-2's conditioning directly from `rolled`/`current`
@@ -450,6 +464,18 @@ def _rollout_trajectory_hardware(
     real_grip_hist: list[float] = []
     joint_hist: list[np.ndarray] = []
     cam_frames: list[list[np.ndarray]] = [[] for _ in range(len(WM_CAM_KEYS))]
+    # Save-only buffers, decoupled from the decision-rate buffers above.
+    # Decisions (candidate generation + WM scoring) fire once per round trip
+    # (now up to wire_skip*(wire_len-1)+1 raw ticks apart, per _wire_action's
+    # dense execution), but training data should stay ~wire_skip-tick-spaced
+    # regardless -- so these accumulate from EVERY entry of each round
+    # trip's received obs_list (a wire_skip-strided window spanning the
+    # whole elapsed period, see examples/droid/main.py's send-side slicing),
+    # not just obs_list[-1]. See write_droid_episode's payload below.
+    save_pose_hist: list[np.ndarray] = []
+    save_grip_hist: list[float] = []
+    save_joint_hist: list[np.ndarray] = []
+    save_cam_frames: list[list[np.ndarray]] = [[] for _ in range(len(WM_CAM_KEYS))]
     instruction = ""
     decision_log: list[dict] = []
     # Self-consistency handoff for `rolled2`: unlike
@@ -471,154 +497,202 @@ def _rollout_trajectory_hardware(
         if result.get("done"):
             break
         obs_list = result["obs"]
-        obs = obs_list[-1]  # most recent of the last-5 buffered observations
+        obs = obs_list[-1]  # most recent of the strided window (see save-buffer loop below)
         instruction = str(obs.get("instruction", instruction))
 
-        for cam_idx, key in enumerate(WM_CAM_KEYS[:num_cams]):
-            cam_frames[cam_idx].append(np.ascontiguousarray(obs[key]))
-        joint_position = np.asarray(obs["joint_position"], dtype=np.float32)
-        gripper_position = float(np.asarray(obs["gripper_position"]).reshape(-1)[0])
-        pose = _fk_pose(joint_position, gripper_position)
-        real_pose_hist.append(pose[:6])
-        real_grip_hist.append(pose[6])
-        joint_hist.append(joint_position[:7])
+        # Save-buffer accumulation: every entry in the received window (the
+        # robot sends a wire_skip-strided slice spanning the whole elapsed
+        # round-trip period, not just the newest tick), so this stays
+        # ~wire_skip-tick-spaced and gapless across round trips regardless
+        # of how long the round-trip period is. Does NOT feed rolled/
+        # real_pose_hist/joint_hist/cam_frames below -- those stay
+        # decision-rate (obs_list[-1] only), unchanged.
+        for save_obs in obs_list:
+            for cam_idx, key in enumerate(WM_CAM_KEYS[:num_cams]):
+                save_cam_frames[cam_idx].append(np.ascontiguousarray(save_obs[key]))
+            save_joint_position = np.asarray(save_obs["joint_position"], dtype=np.float32)
+            save_gripper_position = float(np.asarray(save_obs["gripper_position"]).reshape(-1)[0])
+            save_pose = _fk_pose(save_joint_position, save_gripper_position)
+            save_pose_hist.append(save_pose[:6])
+            save_grip_hist.append(save_pose[6])
+            save_joint_hist.append(save_joint_position[:7])
 
-        latent = _encode_current_latent(obs, encoder, num_cams, per_cam_h, latent_w)
-        rolled.append(latent)
-        if rolled2 is not None:
-            rolled2.append(next_rolled2_seed if next_rolled2_seed is not None else latent.clone())
-            next_rolled2_seed = None
-
-        frame_now = len(rolled) - 1
-        # WM-scored decision every step, including early ones where real
-        # history doesn't fully exist yet -- hist_ids' max(idx_, 0) clipping
-        # below repeats the first real frame for any not-yet-real history
-        # slot ("flat history"), matching the same fallback the checkpoint
-        # was trained to handle (see dataset.py's `skip_his = 0` augmentation
-        # and, for the old server, uq_data_collection.py's explicit
-        # broadcast_to-based flat-history seeding).
         candidates = _generate_candidates(
             policy, action_adapter, obs, external_camera, instruction,
             wire_skip, wire_len, num_candidates, backend)
-        rgb_id = build_frame_ids(frame_now, num_history, num_frames, skip, skip_his)
-        hist_ids = [max(idx_, 0) for idx_ in rgb_id[:num_history]]
-        hist_rows = np.stack(
-            [np.concatenate([real_pose_hist[i], [real_grip_hist[i]]]) for i in hist_ids], axis=0)
 
-        action_tensors = []
-        for _adapted, future_pose, _idx in candidates:
-            full = np.concatenate([hist_rows, future_pose], axis=0)  # (num_history+num_frames, 7)
-            action_tensors.append(normalize_actions(full, p01, p99))
-        action_batch = torch.tensor(np.stack(action_tensors, axis=0), dtype=torch.float32, device=device)
-        texts = [instruction] * num_candidates
+        if policy_only:
+            # Bypass the world model entirely: take the first proposed
+            # candidate as-is. No history/latent bookkeeping, no WM scoring,
+            # no UQ metrics, no candidate-comparison viz -- decision_log
+            # gets a minimal entry so decision_metrics.jsonl / the done-log
+            # line downstream still work (see _process_trajectory's
+            # policy_only guards on candidate_metrics-dependent fields).
+            i_star = 0
+            decision_idx = len(decision_log)
+            decision_log.append({
+                "decision_idx": decision_idx, "t_step": t_step,
+                "policy_only": True, "chosen": i_star,
+            })
+        else:
+            for cam_idx, key in enumerate(WM_CAM_KEYS[:num_cams]):
+                cam_frames[cam_idx].append(np.ascontiguousarray(obs[key]))
+            joint_position = np.asarray(obs["joint_position"], dtype=np.float32)
+            gripper_position = float(np.asarray(obs["gripper_position"]).reshape(-1)[0])
+            pose = _fk_pose(joint_position, gripper_position)
+            real_pose_hist.append(pose[:6])
+            real_grip_hist.append(pose[6])
+            joint_hist.append(joint_position[:7])
 
-        def _hist_cur(buf):
-            hist = torch.stack([buf[i] for i in hist_ids], 0).unsqueeze(0).expand(
-                num_candidates, -1, -1, -1, -1).contiguous().to(device)
-            cur = buf[frame_now].unsqueeze(0).expand(
-                num_candidates, -1, -1, -1).contiguous().to(device)
-            return hist, cur
+            device = next(wm_model.parameters()).device
+            per_cam_h, latent_w = wm_args.height // 8, wm_args.width // 8
+            latent = _encode_current_latent(obs, encoder, num_cams, per_cam_h, latent_w)
+            rolled.append(latent)
+            if rolled2 is not None:
+                rolled2.append(next_rolled2_seed if next_rolled2_seed is not None else latent.clone())
+                next_rolled2_seed = None
 
-        history_latents, current_latent = _hist_cur(rolled)
+            frame_now = len(rolled) - 1
+            # WM-scored decision every step, including early ones where real
+            # history doesn't fully exist yet -- hist_ids' max(idx_, 0) clipping
+            # below repeats the first real frame for any not-yet-real history
+            # slot ("flat history"), matching the same fallback the checkpoint
+            # was trained to handle (see dataset.py's `skip_his = 0` augmentation
+            # and, for the old server, uq_data_collection.py's explicit
+            # broadcast_to-based flat-history seeding).
+            num_history, num_frames = wm_args.num_history, wm_args.num_frames
+            skip, skip_his = 1, 4  # round-trip units; see module-level rationale in the config comments
+            rgb_id = build_frame_ids(frame_now, num_history, num_frames, skip, skip_his)
+            hist_ids = [max(idx_, 0) for idx_ in rgb_id[:num_history]]
+            hist_rows = np.stack(
+                [np.concatenate([real_pose_hist[i], [real_grip_hist[i]]]) for i in hist_ids], axis=0)
 
-        # Shared seed for pass 1 / pass 2: a fresh torch.Generator per call
-        # (not one shared object reused across both __call__s, which would
-        # advance its state between calls and defeat the point) so the two
-        # passes draw identical initial diffusion noise -- isolating the
-        # measured pass1/pass2 divergence to the conditioning difference
-        # instead of ordinary sampling variance. See pipeline_flow_map_ctrl_world.py's
-        # generator-handling fix. Mode-agnostic: applies uniformly to all
-        # uq_epi_mode variants, since it lives at the call sites, not inside
-        # _build_pass2_inputs.
-        noise_seed = torch.Generator().seed()  # random seed, no side effect on global RNG
-        gen1 = torch.Generator(device=device).manual_seed(noise_seed)
+            action_tensors = []
+            for _adapted, future_pose, _idx in candidates:
+                full = np.concatenate([hist_rows, future_pose], axis=0)  # (num_history+num_frames, 7)
+                action_tensors.append(normalize_actions(full, p01, p99))
+            action_batch = torch.tensor(np.stack(action_tensors, axis=0), dtype=torch.float32, device=device)
+            texts = [instruction] * num_candidates
 
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            action_latent = wm_model.action_encoder(
-                action_batch, texts, wm_model.tokenizer, wm_model.text_encoder,
-                wm_args.frame_level_cond)
-            _, pred_latents1, logvar_steps1, vel_steps1 = _pipeline_call(
-                wm_model, wm_pipeline_cls, wm_args, action_latent,
-                current_latent, history_latents, wm_args.his_cond_zero,
-                num_frames, num_inference_steps, generator=gen1)
+            def _hist_cur(buf):
+                hist = torch.stack([buf[i] for i in hist_ids], 0).unsqueeze(0).expand(
+                    num_candidates, -1, -1, -1, -1).contiguous().to(device)
+                cur = buf[frame_now].unsqueeze(0).expand(
+                    num_candidates, -1, -1, -1).contiguous().to(device)
+                return hist, cur
 
-            # Pass-1 always runs first: every mode except "future_overlap"
-            # could build pass-2's inputs independently of pass-1's output,
-            # but "future_overlap" specifically needs pred_latents1 to build
-            # its history2 (splices pass-1's own predicted future frames in)
-            # -- so this ordering is applied uniformly (a no-op dependency
-            # for the other modes, a real one for future_overlap).
-            if uq_epi_mode == "none":
-                pred_latents2 = None
-                logvar_steps2, vel_steps2 = [], []
-            else:
-                history2_latents, current2_latent, his_cond_zero2, action_latent2 = _build_pass2_inputs(
-                    uq_epi_mode=uq_epi_mode, epi_overlap_k=epi_overlap_k,
-                    history_latents=history_latents, current_latent=current_latent,
-                    action_batch=action_batch, action_latent=action_latent,
-                    pred_latents1=pred_latents1, rolled2=rolled2, hist_cur_fn=_hist_cur,
-                    num_history=num_history, num_frames=num_frames,
-                    texts=texts, wm_model=wm_model, wm_args=wm_args, device=device,
-                    overlap_zero_action=overlap_zero_action,
-                )
-                gen2 = torch.Generator(device=device).manual_seed(noise_seed)  # same seed as pass 1
-                _, pred_latents2, logvar_steps2, vel_steps2 = _pipeline_call(
-                    wm_model, wm_pipeline_cls, wm_args, action_latent2,
-                    current2_latent, history2_latents, his_cond_zero2,
-                    num_frames, num_inference_steps, generator=gen2)
+            history_latents, current_latent = _hist_cur(rolled)
 
-        # Independent step counts: uq_epi_mode=="none" leaves logvar_steps2/
-        # vel_steps2 empty, which compute_uq_metrics already handles (it
-        # guards each pass-2-dependent metric group), but a single shared
-        # `n_ode` would IndexError indexing into the empty pass-2 lists.
-        n_ode1, n_ode2 = len(logvar_steps1), len(logvar_steps2)
-        candidate_metrics = []
-        for i in range(num_candidates):
-            lv1_i = [logvar_steps1[s][i] for s in range(n_ode1)]
-            vel1_i = [vel_steps1[s][i] for s in range(n_ode1)]
-            lv2_i = [logvar_steps2[s][i] for s in range(n_ode2)]
-            vel2_i = [vel_steps2[s][i] for s in range(n_ode2)]
-            candidate_metrics.append(compute_uq_metrics(lv1_i, vel1_i, lv2_i, vel2_i))
+            # Shared seed for pass 1 / pass 2: a fresh torch.Generator per call
+            # (not one shared object reused across both __call__s, which would
+            # advance its state between calls and defeat the point) so the two
+            # passes draw identical initial diffusion noise -- isolating the
+            # measured pass1/pass2 divergence to the conditioning difference
+            # instead of ordinary sampling variance. See pipeline_flow_map_ctrl_world.py's
+            # generator-handling fix. Mode-agnostic: applies uniformly to all
+            # uq_epi_mode variants, since it lives at the call sites, not inside
+            # _build_pass2_inputs.
+            noise_seed = torch.Generator().seed()  # random seed, no side effect on global RNG
+            gen1 = torch.Generator(device=device).manual_seed(noise_seed)
 
-        i_star = max(range(num_candidates), key=lambda i: candidate_metrics[i][uq_metric])
-        decision_idx = len(decision_log)
-        decision_log.append({
-            "decision_idx": decision_idx, "t_step": t_step, "uq_metric": uq_metric,
-            "chosen": i_star, "candidate_metrics": candidate_metrics,
-        })
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                action_latent = wm_model.action_encoder(
+                    action_batch, texts, wm_model.tokenizer, wm_model.text_encoder,
+                    wm_args.frame_level_cond)
+                _, pred_latents1, logvar_steps1, vel_steps1 = _pipeline_call(
+                    wm_model, wm_pipeline_cls, wm_args, action_latent,
+                    current_latent, history_latents, wm_args.his_cond_zero,
+                    num_frames, num_inference_steps, generator=gen1)
 
-        if (viz_enabled and uq_epi_mode != "none"
-                and decision_idx % max(1, viz_every_n_decisions) == 0
-                and (viz_max_decisions is None or decision_idx < viz_max_decisions)):
-            viz_dir.mkdir(parents=True, exist_ok=True)
-            _save_decision_viz(
-                viz_dir / f"decision_{decision_idx:03d}", i_star,
-                pred_latents1, pred_latents2, logvar_steps1, vel_steps1,
-                logvar_steps2, vel_steps2, wm_model.pipeline, wm_args, viz_fps)
+                # Pass-1 always runs first: every mode except "future_overlap"
+                # could build pass-2's inputs independently of pass-1's output,
+                # but "future_overlap" specifically needs pred_latents1 to build
+                # its history2 (splices pass-1's own predicted future frames in)
+                # -- so this ordering is applied uniformly (a no-op dependency
+                # for the other modes, a real one for future_overlap).
+                if uq_epi_mode == "none":
+                    pred_latents2 = None
+                    logvar_steps2, vel_steps2 = [], []
+                else:
+                    history2_latents, current2_latent, his_cond_zero2, action_latent2 = _build_pass2_inputs(
+                        uq_epi_mode=uq_epi_mode, epi_overlap_k=epi_overlap_k,
+                        history_latents=history_latents, current_latent=current_latent,
+                        action_batch=action_batch, action_latent=action_latent,
+                        pred_latents1=pred_latents1, rolled2=rolled2, hist_cur_fn=_hist_cur,
+                        num_history=num_history, num_frames=num_frames,
+                        texts=texts, wm_model=wm_model, wm_args=wm_args, device=device,
+                        overlap_zero_action=overlap_zero_action,
+                    )
+                    gen2 = torch.Generator(device=device).manual_seed(noise_seed)  # same seed as pass 1
+                    _, pred_latents2, logvar_steps2, vel_steps2 = _pipeline_call(
+                        wm_model, wm_pipeline_cls, wm_args, action_latent2,
+                        current2_latent, history2_latents, his_cond_zero2,
+                        num_frames, num_inference_steps, generator=gen2)
+
+            # Independent step counts: uq_epi_mode=="none" leaves logvar_steps2/
+            # vel_steps2 empty, which compute_uq_metrics already handles (it
+            # guards each pass-2-dependent metric group), but a single shared
+            # `n_ode` would IndexError indexing into the empty pass-2 lists.
+            n_ode1, n_ode2 = len(logvar_steps1), len(logvar_steps2)
+            candidate_metrics = []
+            for i in range(num_candidates):
+                lv1_i = [logvar_steps1[s][i] for s in range(n_ode1)]
+                vel1_i = [vel_steps1[s][i] for s in range(n_ode1)]
+                lv2_i = [logvar_steps2[s][i] for s in range(n_ode2)]
+                vel2_i = [vel_steps2[s][i] for s in range(n_ode2)]
+                candidate_metrics.append(compute_uq_metrics(lv1_i, vel1_i, lv2_i, vel2_i))
+
+            i_star = max(range(num_candidates), key=lambda i: candidate_metrics[i][uq_metric])
+            decision_idx = len(decision_log)
+            decision_log.append({
+                "decision_idx": decision_idx, "t_step": t_step, "uq_metric": uq_metric,
+                "chosen": i_star, "candidate_metrics": candidate_metrics,
+            })
+
+            if (viz_enabled and uq_epi_mode != "none"
+                    and decision_idx % max(1, viz_every_n_decisions) == 0
+                    and (viz_max_decisions is None or decision_idx < viz_max_decisions)):
+                viz_dir.mkdir(parents=True, exist_ok=True)
+                _save_decision_viz(
+                    viz_dir / f"decision_{decision_idx:03d}", i_star,
+                    pred_latents1, pred_latents2, logvar_steps1, vel_steps1,
+                    logvar_steps2, vel_steps2, wm_model.pipeline, wm_args, viz_fps)
+
+            if rolled2 is not None:  # uq_epi_mode == "iterative" only
+                # Seed rolled2's entry for the NEXT round-trip with pass-1's
+                # one-step-ahead (k=1) prediction from the chosen candidate, so
+                # that decision conditions pass 2 on this decision's
+                # true-history prediction rather than ground truth --
+                # self-consistency. (k=0 is a re-prediction of THIS already-
+                # observed frame, not a future one -- see build_frame_ids.)
+                next_rolled2_seed = pred_latents1[i_star, 1].float().cpu()
 
         adapted, _future_pose, idx = candidates[i_star]
-        action = _wire_action(adapted, idx)
+        # exec_len = the last raw tick the WM actually scored (idx[-1]) + 1
+        # -- the robot executes the real dense chunk up to exactly as far
+        # as this decision was verified for, never further into unverified
+        # open-loop territory. (policy_only: idx is still the wire_skip-
+        # strided slice _generate_candidates always computes -- WM scoring
+        # is what's skipped, not this bookkeeping.)
+        exec_len = idx[-1] + 1
+        action = _wire_action(adapted, exec_len)
 
-        if rolled2 is not None:  # uq_epi_mode == "iterative" only
-            # Seed rolled2's entry for the NEXT round-trip with pass-1's
-            # one-step-ahead (k=1) prediction from the chosen candidate, so
-            # that decision conditions pass 2 on this decision's
-            # true-history prediction rather than ground truth --
-            # self-consistency. (k=0 is a re-prediction of THIS already-
-            # observed frame, not a future one -- see build_frame_ids.)
-            next_rolled2_seed = pred_latents1[i_star, 1].float().cpu()
-
-        assert action.shape == (wire_len, 8), f"expected ({wire_len}, 8) wire action, got {action.shape}"
+        assert action.shape == (exec_len, 8), f"expected ({exec_len}, 8) wire action, got {action.shape}"
         channel.send_action(t_step, action, instruction)
 
         t_step += 1
 
+    # Sourced from the dense, wire_skip-spaced save buffers (NOT
+    # cam_frames/real_pose_hist/joint_hist, which stay decision-rate and
+    # feed only the WM's own history/scoring above) -- so the exported
+    # episode's temporal density tracks wire_skip regardless of how long
+    # the decision round-trip period (open_loop_horizon) is.
     payload = {
         "cam_rgb": [np.stack(frames, axis=0) if frames else np.zeros((0,), dtype=np.uint8)
-                    for frames in cam_frames],
-        "cart": np.stack(real_pose_hist, axis=0) if real_pose_hist else np.zeros((0, 6), np.float32),
-        "grip": np.asarray(real_grip_hist, dtype=np.float32),
-        "joint_position": np.stack(joint_hist, axis=0) if joint_hist else np.zeros((0, 7), np.float32),
+                    for frames in save_cam_frames],
+        "cart": np.stack(save_pose_hist, axis=0) if save_pose_hist else np.zeros((0, 6), np.float32),
+        "grip": np.asarray(save_grip_hist, dtype=np.float32),
+        "joint_position": np.stack(save_joint_hist, axis=0) if save_joint_hist else np.zeros((0, 7), np.float32),
     }
     return payload, decision_log, instruction
 
@@ -734,52 +808,79 @@ def main() -> None:
             f'active_uq.uq_epi_mode="none" runs no pass-2 scoring, so active_uq.uq_metric '
             f"must be one of {PASS1_ONLY_METRICS}, got {uq_metric!r}")
     num_inference_steps = int(uq_cfg.get("num_inference_steps", 15))
-    wire_skip = int(uq_cfg.get("wire_skip", 2))
+    wire_skip = int(uq_cfg.get("wire_skip", 3))
     wire_len = int(uq_cfg.get("wire_len", 5))
-    wm_checkpoint = uq_cfg["wm_checkpoint"]
-    stat_root = uq_cfg["stat_root"]
+    num_cams = int(uq_cfg.get("num_cams", 3))
+    height = int(uq_cfg.get("height", 192))
+    width = int(uq_cfg.get("width", 320))
 
-    logger.info("Loading UQ world model from %s", wm_checkpoint)
-    wm_model, wm_pipeline_cls, wm_args, wm_use_uq = load_crtl_world(
-        wm_checkpoint,
-        svd_model_path=save_cfg.get("svd_path", "external/stable-video-diffusion-img2vid"),
-        clip_model_path=uq_cfg.get("clip_model_path", "external/clip-vit-base-patch32"),
-        data_root=str(save_cfg.get("output_root", "data/droid_hardware_active_uq_collected")),
-        stat_root=stat_root,
-        suites=[WM_TRAIN_SUITE],
-        device=device,
-        predict_uncertainty=True,
-        tag="droid_hardware_active_uq",
-        num_cams=int(uq_cfg.get("num_cams", 3)),
-        height=int(uq_cfg.get("height", 192)),
-        width=int(uq_cfg.get("width", 320)),
-        down_sample=int(uq_cfg.get("down_sample", 3)),
-    )
-    if not wm_use_uq:
-        raise SystemExit(f"checkpoint {wm_checkpoint} has no UQ head; cannot score candidates.")
-    if wire_len != wm_args.num_frames:
-        raise SystemExit(
-            f"active_uq.wire_len ({wire_len}) must equal the checkpoint's num_frames "
-            f"({wm_args.num_frames}) -- the same {wire_len}-step candidate slice is reused "
-            "for both the world model's future-conditioning targets and the wire-format action.")
-    if wire_len != 5:
-        raise SystemExit(
-            f"active_uq.wire_len ({wire_len}) must be 5 -- the robot's "
-            "uq_data_collection/examples/droid/main.py hardcodes "
-            "`assert pred_action_chunk.shape == (5, 8)` and is not modified by this pipeline.")
-    if uq_epi_mode == "future_overlap" and not wm_args.frame_level_cond:
-        raise SystemExit(
-            'active_uq.uq_epi_mode="future_overlap" requires the checkpoint\'s '
-            "frame_level_cond=True -- with frame_level_cond=False the action encoder "
-            "flattens (T, action_dim) to a fixed-width vector before its first Linear "
-            "layer, and appending overlap action rows would silently change that width.")
+    # policy_only: bypass the world model entirely. MolmoAct2/openpi
+    # candidates still get generated every round trip (so the policy +
+    # comms/execution pipeline get exercised end-to-end), but the FIRST
+    # proposed candidate is sent as-is -- no WM scoring, no UQ metrics, no
+    # candidate-comparison viz. Skips loading the (slow, GPU-heavy) WM
+    # checkpoint entirely -- useful for a quick, isolated check that the
+    # policy + robot execution work correctly before bringing the WM in.
+    policy_only = bool(uq_cfg.get("policy_only", False))
 
-    p01, p99 = _load_stat(stat_root, WM_TRAIN_SUITE)
+    exec_len = wire_skip * (wire_len - 1) + 1
+    n_action_steps = int(pol_cfg.get(backend, {}).get("n_action_steps", 0)) if backend == "molmoact2" else None
+    if n_action_steps and exec_len > n_action_steps:
+        raise SystemExit(
+            f"active_uq.wire_skip*(wire_len-1)+1 ({exec_len}) exceeds "
+            f"policy.{backend}.n_action_steps ({n_action_steps}) -- the policy chunk isn't "
+            "long enough to cover the configured stride/length; lower wire_skip or "
+            "raise n_action_steps.")
+
+    if policy_only:
+        logger.info(
+            "active_uq.policy_only=true -- skipping world model load entirely; the FIRST "
+            "proposed candidate from every round trip is sent as-is, no UQ scoring.")
+        wm_model = wm_pipeline_cls = wm_args = None
+        p01 = p99 = None
+        wm_checkpoint = None
+    else:
+        wm_checkpoint = uq_cfg["wm_checkpoint"]
+        stat_root = uq_cfg["stat_root"]
+
+        logger.info("Loading UQ world model from %s", wm_checkpoint)
+        wm_model, wm_pipeline_cls, wm_args, wm_use_uq = load_crtl_world(
+            wm_checkpoint,
+            svd_model_path=save_cfg.get("svd_path", "external/stable-video-diffusion-img2vid"),
+            clip_model_path=uq_cfg.get("clip_model_path", "external/clip-vit-base-patch32"),
+            data_root=str(save_cfg.get("output_root", "data/droid_hardware_active_uq_collected")),
+            stat_root=stat_root,
+            suites=[WM_TRAIN_SUITE],
+            device=device,
+            predict_uncertainty=True,
+            tag="droid_hardware_active_uq",
+            num_cams=num_cams,
+            height=height,
+            width=width,
+            down_sample=int(uq_cfg.get("down_sample", 3)),
+        )
+        if not wm_use_uq:
+            raise SystemExit(f"checkpoint {wm_checkpoint} has no UQ head; cannot score candidates.")
+        if wire_len != wm_args.num_frames:
+            raise SystemExit(
+                f"active_uq.wire_len ({wire_len}) must equal the checkpoint's num_frames "
+                f"({wm_args.num_frames}) -- the {wire_len}-step, wire_skip-strided candidate "
+                "slice is the world model's future-conditioning target (the robot's wire "
+                "action is a separate, dense, un-strided prefix of the same chunk -- see "
+                "_wire_action).")
+        if uq_epi_mode == "future_overlap" and not wm_args.frame_level_cond:
+            raise SystemExit(
+                'active_uq.uq_epi_mode="future_overlap" requires the checkpoint\'s '
+                "frame_level_cond=True -- with frame_level_cond=False the action encoder "
+                "flattens (T, action_dim) to a fixed-width vector before its first Linear "
+                "layer, and appending overlap action rows would silently change that width.")
+
+        p01, p99 = _load_stat(stat_root, WM_TRAIN_SUITE)
 
     encoder = LatentEncoder(
         save_cfg.get("svd_path", "external/stable-video-diffusion-img2vid"),
         device=save_cfg.get("device", "cuda"),
-        target_h=wm_args.height, target_w=wm_args.width,
+        target_h=height, target_w=width,
     )
 
     external_camera = hw_cfg.get("external_camera", "right")
@@ -794,6 +895,10 @@ def main() -> None:
     viz_max_decisions = viz_cfg.get("max_decisions_per_episode")
     viz_max_decisions = int(viz_max_decisions) if viz_max_decisions is not None else None
     viz_fps = int(viz_cfg.get("fps", 3))
+    if policy_only and viz_enabled:
+        logger.info("active_uq.policy_only=true -- ignoring active_uq.viz.enabled "
+                    "(no WM scoring to visualize).")
+        viz_enabled = False
     if uq_epi_mode == "none" and viz_enabled:
         raise SystemExit(
             'active_uq.viz.enabled=true requires active_uq.uq_epi_mode != "none" -- '
@@ -832,10 +937,15 @@ def main() -> None:
             obs_timeout_s=obs_timeout_s, poll_interval_s=poll_interval_s,
             viz_enabled=viz_enabled, viz_every_n_decisions=viz_every_n_decisions,
             viz_max_decisions=viz_max_decisions, viz_fps=viz_fps, viz_dir=viz_dir,
+            num_cams=num_cams, policy_only=policy_only,
         )
 
         episode_id = f"{next_episode_id(output_root, suite_name):06d}"
-        chosen_scores = [d["candidate_metrics"][d["chosen"]][uq_metric] for d in decision_log]
+        # decision_log entries carry no "candidate_metrics" in policy_only mode
+        # (no WM scoring happened) -- guard both UQ-summary computations.
+        chosen_scores = (
+            [d["candidate_metrics"][d["chosen"]][uq_metric] for d in decision_log]
+            if not policy_only else [])
         write_droid_episode(
             suite=suite_name, split="train", episode_id=episode_id, output_root=output_root,
             encoder=encoder if encode_latents else None,
@@ -843,7 +953,7 @@ def main() -> None:
             joint_position=payload["joint_position"], language=instruction,
             fps=raw_fps, down_sample=export_down_sample, write_raw=write_raw,
             extra_annotation={
-                "policy_backend": backend,
+                "policy_backend": backend, "policy_only": policy_only,
                 "num_candidates": num_candidates, "uq_metric": uq_metric,
                 "uq_epi_mode": uq_epi_mode,
                 "wm_checkpoint": str(wm_checkpoint), "num_decisions": len(decision_log),
@@ -853,7 +963,7 @@ def main() -> None:
                         max(d["candidate_metrics"][i][uq_metric] for i in range(num_candidates))
                         - min(d["candidate_metrics"][i][uq_metric] for i in range(num_candidates))
                         for d in decision_log
-                    ])) if decision_log else None),
+                    ])) if (decision_log and not policy_only) else None),
             },
         )
         for d in decision_log:
@@ -865,7 +975,7 @@ def main() -> None:
         decision_fh.flush()
         train_ids.append(episode_id)
 
-        logger.info("[traj %d] done: %d decisions, %d round-trips -> episode %s",
+        logger.info("[traj %d] done: %d decisions (round-trips), %d saved samples -> episode %s",
                     traj_idx, len(decision_log), payload["cart"].shape[0], episode_id)
 
     n_done = 0
