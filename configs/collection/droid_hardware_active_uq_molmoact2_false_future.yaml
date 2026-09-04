@@ -52,7 +52,7 @@ policy:
     # wider spread between candidates (the checkpoint default is 10). If the
     # pilot shows the 7 UQ metrics collapsing across candidates, drop this to
     # 5-7.
-    num_steps: 10
+    num_steps: 5
     # Steps returned per candidate; must be >= 13 (stride-3 x 5 with a
     # prepended current row needs index 12). franka_droid's tag gives 15
     # (margin of 2).
@@ -91,7 +91,7 @@ hardware:
   obs_timeout_s: 60
   max_steps: 10000
   # Start with 1 for the pilot; raise for a real collection run.
-  num_trajectories: 2
+  num_trajectories: 4
 
 active_uq:
   # Testing-only bypass: skips loading the world model checkpoint entirely
@@ -108,7 +108,7 @@ active_uq:
   # collection on this pairing's own decision_metrics.jsonl candidate spreads
   # -- do not assume the single_hist_v1 config's spread check transfers.
   num_candidates: 4
-  uq_metric: mean_pdf_diff
+  uq_metric: mean_epi_var
   uq_epi_mode: future_overlap
   # How many of each candidate's own future frames to splice into pass-2's
   # history. 0 = max (num_frames - 1). The sibling job
@@ -161,7 +161,7 @@ save:
   # Per-experiment suite -- keeps this pairing fully separate on disk from
   # both the openpi runs and the other MolmoAct2 (single_hist_v1) pairing.
   # Rename when wm_checkpoint or uq_epi_mode changes again.
-  suite_name: droid_ctrl_world_hardware_molmoact2_false_future_v1
+  suite_name: droid_ctrl_world_hardware_molmoact2_false_future_v1_epi_var
   write_raw: true
   encode_latents: true
   svd_path: external/stable-video-diffusion-img2vid
