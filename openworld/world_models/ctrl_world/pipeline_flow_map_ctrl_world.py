@@ -16,6 +16,8 @@ from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import _resize_with_antialiasing
 
+from .attention_masks import apply_temporal_attention_mask, build_temporal_attention_mask
+
 def svd_tensor2vid(video: torch.Tensor, processor, output_type="np"):
     # Based on:
     # https://github.com/modelscope/modelscope/blob/1509fdb973e5871f37148a4b5e5964cafd43e64d/modelscope/pipelines/multi_modal/text_to_video_synthesis_pipeline.py#L78
@@ -272,6 +274,8 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         flow_map_type='shortcut',
         flow_map_loss_type='psd',
         return_uncertainty: bool = False,
+        overlap_k: int = 0,
+        overlap_active: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -504,6 +508,11 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                 num_his, history, cond_wrist,
                 frame_level_cond, do_classifier_free_guidance,
                 return_uncertainty=return_uncertainty,
+                # overlap_k/overlap_active: only threaded through this
+                # (flow_matching) branch -- masking is not yet verified for
+                # the shortcut/flow_map branches above/below, see
+                # attention_masks.py's module docstring caveats.
+                overlap_k=overlap_k, overlap_active=overlap_active,
             )
         elif flow_map_type == 'flow_map':
             latents, logvar_steps, vel_steps = self.flow_map_solver(
@@ -540,11 +549,19 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
 
 
     @torch.no_grad()
-    def predict_v(self, t, x_t, 
+    def predict_v(self, t, x_t,
                   image_latents, image_embeddings, added_time_ids, num_his,
-                  history=None, cond_wrist=None, distance=None, 
-                  frame_level_cond = False, 
-                  do_classifier_free_guidance=False):
+                  history=None, cond_wrist=None, distance=None,
+                  frame_level_cond = False,
+                  do_classifier_free_guidance=False,
+                  overlap_k: int = 0, overlap_active: bool = False):
+        """overlap_k/overlap_active: mirror flow_map_ctrl_world.py's _predict_v
+        (training) -- overlap_k is the size of the history-future-overlap peek
+        segment already included in `history`/`num_his` (0 = no peek segment
+        reserved, the pre-mask_history_from_peek default; no mask applied).
+        overlap_active is whether that segment holds real content (True) or
+        is a zero-padded placeholder (False), only meaningful when
+        overlap_k > 0. See attention_masks.py."""
         B, F, C, H, W =  x_t.shape
 
         sigma = ((1.0 - t) / t).clamp(min=0.02, max=700)
@@ -579,7 +596,24 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         
         if distance is not None:
             distance = torch.cat([distance] * 2) if do_classifier_free_guidance else distance
-        
+
+        mask = None
+        if overlap_k > 0:
+            # `history` (and hence num_his) is already CFG-doubled by the
+            # caller (__call__) when applicable; `x_t`/B is not (predict_v
+            # doubles it itself above, via latent_model_input) -- so the mask's
+            # batch dim must match latent_model_input's *doubled* batch here.
+            mask_batch_size = B * 2 if do_classifier_free_guidance else B
+            mask = build_temporal_attention_mask(
+                batch_size=mask_batch_size,
+                true_hist_len=num_his - overlap_k,
+                max_overlap_slots=overlap_k,
+                overlap_active=overlap_active,
+                num_target=F,
+                device=x_t.device,
+            )
+        apply_temporal_attention_mask(self.unet, mask)
+
         unet_out = self.unet(
             latent_model_input,
             c_noise,
@@ -689,7 +723,8 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                          num_his=0, history=None, cond_wrist=None,
                          frame_level_cond = False,
                          do_classifier_free_guidance=False,
-                         return_uncertainty=False):
+                         return_uncertainty=False,
+                         overlap_k: int = 0, overlap_active: bool = False):
         B = latents.shape[0]
         device = latents.device
         logvar_steps = []
@@ -716,7 +751,8 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                         added_time_ids, num_his,
                         history=history, cond_wrist=cond_wrist, distance=None,
                         frame_level_cond=frame_level_cond,
-                        do_classifier_free_guidance=do_classifier_free_guidance)
+                        do_classifier_free_guidance=do_classifier_free_guidance,
+                        overlap_k=overlap_k, overlap_active=overlap_active)
 
                 if return_uncertainty and logvar is not None:
                     logvar_steps.append(logvar.detach().cpu())

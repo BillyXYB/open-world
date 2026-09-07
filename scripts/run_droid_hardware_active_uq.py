@@ -298,8 +298,11 @@ def _wire_action(adapted: AdaptedActionChunk, exec_len: int) -> np.ndarray:
 def _pipeline_call(
     wm_model, wm_pipeline_cls, wm_args, action_latent,
     image, history, his_cond_zero, num_frames, num_inference_steps,
-    generator=None,
+    generator=None, overlap_k: int = 0, overlap_active: bool = False,
 ):
+    """overlap_k/overlap_active: see attention_masks.py -- 0/False (defaults)
+    preserve unmasked behavior for every checkpoint not trained with
+    mask_history_from_peek."""
     return wm_pipeline_cls.__call__(
         wm_model.pipeline, image=image, text=action_latent,
         width=wm_args.width, height=int(wm_args.num_cams * wm_args.height),
@@ -312,6 +315,7 @@ def _pipeline_call(
         frame_level_cond=wm_args.frame_level_cond, his_cond_zero=his_cond_zero,
         flow_map_type=wm_args.flow_map_type, flow_map_loss_type=wm_args.flow_map_loss_type,
         return_uncertainty=True, generator=generator,
+        overlap_k=overlap_k, overlap_active=overlap_active,
     )
 
 
@@ -369,13 +373,21 @@ def _build_pass2_inputs(
     num_history: int, num_frames: int,
     texts: list, wm_model, wm_args, device,
     overlap_zero_action: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]:
-    """Build (history2, current2, his_cond_zero2, action_latent2) for one of
-    the 5 non-"none" uq_epi_mode strategies. Batched-over-candidates,
+    mask_history_from_peek: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor, int]:
+    """Build (history2, current2, his_cond_zero2, action_latent2, overlap_k_used)
+    for one of the 5 non-"none" uq_epi_mode strategies. Batched-over-candidates,
     streaming analogue of replay_libero_wm_traj.py::replay_episode's pass-2
     dispatch (lines ~275-304 there); never called for uq_epi_mode=="none".
     All tensors here carry a leading `num_candidates` batch dim (this
     script's convention), vs. replay's batch-of-1.
+
+    `overlap_k_used` is 0 for every mode except "future_overlap" -- pass it to
+    _pipeline_call's overlap_k (with overlap_active=True, since this pass-2
+    peek is always real content) to mask temporal attention; the caller must
+    also give pass-1 the same fixed-length, zero-padded peek slots (see
+    _rollout_trajectory_hardware) for the two passes' sequence lengths to
+    match, which is what mask_history_from_peek's masking depends on.
 
     NOT called for "iterative" unless `rolled2` is populated by the caller --
     see _rollout_trajectory_hardware's conditional `rolled2` allocation.
@@ -385,13 +397,13 @@ def _build_pass2_inputs(
     if uq_epi_mode == "zero_history":
         # Reuse pass-1's real history/current verbatim; the degradation is
         # the model's own internal "zero out history conditioning" flag.
-        return history_latents, current_latent, True, action_latent2
+        return history_latents, current_latent, True, action_latent2, 0
 
     if uq_epi_mode == "flat_history":
         # Repeat the CURRENT ("now") frame across all history slots -- zero
         # temporal offset anywhere in pass-2's conditioning.
         history2 = current_latent.unsqueeze(1).expand(-1, num_history, -1, -1, -1).contiguous()
-        return history2, current_latent, False, action_latent2
+        return history2, current_latent, False, action_latent2, 0
 
     if uq_epi_mode == "single_history":
         # Repeat the LAST (most recent) real history slot -- a single real,
@@ -399,13 +411,26 @@ def _build_pass2_inputs(
         # Matches droid_flow_matching_uq_single_hist_v1's training augmentation.
         last_hist = history_latents[:, -1:, :, :, :]
         history2 = last_hist.expand(-1, num_history, -1, -1, -1).contiguous()
-        return history2, current_latent, False, action_latent2
+        return history2, current_latent, False, action_latent2, 0
 
     if uq_epi_mode == "future_overlap":
         # Needs pass-1's OUTPUT (pred_latents1) -- caller must run pass-1
         # first and pass its result in here before pass-2 can be built.
-        overlap_k_used = epi_overlap_k if epi_overlap_k > 0 else (num_frames - 1)
-        overlap_k_used = max(1, min(overlap_k_used, num_frames - 1))
+        if mask_history_from_peek:
+            # A mask_history_from_peek checkpoint was trained with
+            # fixed_overlap_k forced True -- it has never seen anything
+            # other than the full max_overlap_slots peek window. Force it
+            # here (ignore a smaller epi_overlap_k) so this stays equal to
+            # pass-1's padded length -- see run_droid_hardware_active_uq.py's
+            # pass-1 construction and replay_libero_wm_traj.py's matching fix.
+            if 0 < epi_overlap_k < num_frames - 1:
+                logging.warning(
+                    "epi_overlap_k=%d ignored -- mask_history_from_peek forces "
+                    "the full max_overlap_slots=%d.", epi_overlap_k, num_frames - 1)
+            overlap_k_used = num_frames - 1
+        else:
+            overlap_k_used = epi_overlap_k if epi_overlap_k > 0 else (num_frames - 1)
+            overlap_k_used = max(1, min(overlap_k_used, num_frames - 1))
         overlap_frames = pred_latents1[:, 1:1 + overlap_k_used].to(
             device=device, dtype=history_latents.dtype)
         history2 = torch.cat([history_latents, overlap_frames], dim=1)
@@ -424,13 +449,13 @@ def _build_pass2_inputs(
             action_latent2 = wm_model.action_encoder(
                 action2_for_encoder, texts, wm_model.tokenizer, wm_model.text_encoder,
                 wm_args.frame_level_cond)
-        return history2, current_latent, False, action_latent2
+        return history2, current_latent, False, action_latent2, overlap_k_used
 
     # "iterative": pass-2 conditions on the model's own self-predicted
     # history (rolled2), seeded/advanced by the caller across round-trips.
     assert rolled2 is not None, "rolled2 must be built by the caller when uq_epi_mode == 'iterative'"
     history2, current2 = hist_cur_fn(rolled2)
-    return history2, current2, False, action_latent2
+    return history2, current2, False, action_latent2, 0
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +468,7 @@ def _rollout_trajectory_hardware(
     p01, p99, encoder: LatentEncoder, channel, external_camera: str,
     num_candidates: int, uq_metric: str, uq_epi_mode: str, epi_overlap_k: int,
     overlap_zero_action: bool,
+    mask_history_from_peek: bool,
     num_inference_steps: int,
     wire_skip: int, wire_len: int, max_steps: int,
     obs_timeout_s: float, poll_interval_s: float,
@@ -594,6 +620,30 @@ def _rollout_trajectory_hardware(
 
             history_latents, current_latent = _hist_cur(rolled)
 
+            # mask_history_from_peek: pass-1 ALSO reserves num_frames-1
+            # zero-padded peek slots (spliced between history and
+            # current/future, mirroring training's splice order) so its
+            # total sequence length matches pass-2's future_overlap
+            # construction below -- see attention_masks.py's module
+            # docstring. Only meaningful paired with uq_epi_mode==
+            # "future_overlap" (the only pass-2 branch that reserves this
+            # same padding); see _build_pass2_inputs's docstring.
+            max_overlap_slots = num_frames - 1
+            pad_p1 = mask_history_from_peek and uq_epi_mode == "future_overlap"
+            if pad_p1:
+                pad_latents = torch.zeros(
+                    num_candidates, max_overlap_slots, *history_latents.shape[2:],
+                    dtype=history_latents.dtype, device=device)
+                history_latents_p1 = torch.cat([history_latents, pad_latents], dim=1)
+                pad_action = torch.zeros(
+                    num_candidates, max_overlap_slots, action_batch.shape[-1],
+                    dtype=action_batch.dtype, device=action_batch.device)
+                action_batch_p1 = torch.cat(
+                    [action_batch[:, :num_history], pad_action, action_batch[:, num_history:]], dim=1)
+            else:
+                history_latents_p1 = history_latents
+                action_batch_p1 = action_batch
+
             # Shared seed for pass 1 / pass 2: a fresh torch.Generator per call
             # (not one shared object reused across both __call__s, which would
             # advance its state between calls and defeat the point) so the two
@@ -608,12 +658,15 @@ def _rollout_trajectory_hardware(
 
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
                 action_latent = wm_model.action_encoder(
-                    action_batch, texts, wm_model.tokenizer, wm_model.text_encoder,
+                    action_batch_p1, texts, wm_model.tokenizer, wm_model.text_encoder,
                     wm_args.frame_level_cond)
                 _, pred_latents1, logvar_steps1, vel_steps1 = _pipeline_call(
                     wm_model, wm_pipeline_cls, wm_args, action_latent,
-                    current_latent, history_latents, wm_args.his_cond_zero,
-                    num_frames, num_inference_steps, generator=gen1)
+                    current_latent, history_latents_p1, wm_args.his_cond_zero,
+                    num_frames, num_inference_steps, generator=gen1,
+                    overlap_k=(max_overlap_slots if pad_p1 else 0),
+                    overlap_active=False,  # pass-1 never has a real peek
+                )
 
                 # Pass-1 always runs first: every mode except "future_overlap"
                 # could build pass-2's inputs independently of pass-1's output,
@@ -625,7 +678,7 @@ def _rollout_trajectory_hardware(
                     pred_latents2 = None
                     logvar_steps2, vel_steps2 = [], []
                 else:
-                    history2_latents, current2_latent, his_cond_zero2, action_latent2 = _build_pass2_inputs(
+                    history2_latents, current2_latent, his_cond_zero2, action_latent2, overlap_k_used = _build_pass2_inputs(
                         uq_epi_mode=uq_epi_mode, epi_overlap_k=epi_overlap_k,
                         history_latents=history_latents, current_latent=current_latent,
                         action_batch=action_batch, action_latent=action_latent,
@@ -633,12 +686,18 @@ def _rollout_trajectory_hardware(
                         num_history=num_history, num_frames=num_frames,
                         texts=texts, wm_model=wm_model, wm_args=wm_args, device=device,
                         overlap_zero_action=overlap_zero_action,
+                        mask_history_from_peek=mask_history_from_peek,
                     )
                     gen2 = torch.Generator(device=device).manual_seed(noise_seed)  # same seed as pass 1
+                    # overlap_active=True whenever overlap_k_used>0 -- this
+                    # pass-2 peek (built above) is always real content, unlike
+                    # pass-1's zero-padded placeholder.
                     _, pred_latents2, logvar_steps2, vel_steps2 = _pipeline_call(
                         wm_model, wm_pipeline_cls, wm_args, action_latent2,
                         current2_latent, history2_latents, his_cond_zero2,
-                        num_frames, num_inference_steps, generator=gen2)
+                        num_frames, num_inference_steps, generator=gen2,
+                        overlap_k=overlap_k_used, overlap_active=(overlap_k_used > 0),
+                    )
 
             # Independent step counts: uq_epi_mode=="none" leaves logvar_steps2/
             # vel_steps2 empty, which compute_uq_metrics already handles (it
@@ -817,6 +876,12 @@ def main() -> None:
     # (see config.py's docstring): True for droid_flow_matching_uq_false_future_v1
     # and later, False for droid_flow_matching_uq_future_overlap_v1 and earlier.
     overlap_zero_action = bool(uq_cfg.get("overlap_zero_action", False))
+    # Must match the loaded checkpoint's mask_history_from_peek training
+    # setting (see config.py's docstring and attention_masks.py's module
+    # docstring): True for droid_flow_matching_uq_false_future_v3 and later,
+    # False for v1/v2 and earlier (never trained with a masked, fixed-length
+    # sequence).
+    mask_history_from_peek = bool(uq_cfg.get("mask_history_from_peek", False))
     if uq_epi_mode == "none" and uq_metric not in PASS1_ONLY_METRICS:
         raise SystemExit(
             f'active_uq.uq_epi_mode="none" runs no pass-2 scoring, so active_uq.uq_metric '
@@ -946,6 +1011,7 @@ def main() -> None:
             external_camera=external_camera, num_candidates=num_candidates,
             uq_metric=uq_metric, uq_epi_mode=uq_epi_mode, epi_overlap_k=epi_overlap_k,
             overlap_zero_action=overlap_zero_action,
+            mask_history_from_peek=mask_history_from_peek,
             num_inference_steps=num_inference_steps,
             wire_skip=wire_skip, wire_len=wire_len, max_steps=max_steps,
             obs_timeout_s=obs_timeout_s, poll_interval_s=poll_interval_s,

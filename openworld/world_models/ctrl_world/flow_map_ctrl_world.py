@@ -2,6 +2,7 @@
 from .pipeline_stable_video_diffusion import StableVideoDiffusionPipeline
 from .pipeline_flow_map_ctrl_world import CtrlWorldDiffusionPipeline
 from .flow_map_unet_spatio_temporal_condition import UNetSpatioTemporalConditionModel
+from .attention_masks import apply_temporal_attention_mask, build_temporal_attention_mask, patch_temporal_attention_masking
 from .flow_map_utils import create_targets_shortcut, create_targets, create_targets_flow_matching, create_targets_lsd, create_targets_psd, create_targets_one_step
 
 import numpy as np
@@ -239,9 +240,14 @@ class CrtlWorld(nn.Module):
         # unet.set_attn_processor(AttnProcessor2_0())
         
         self.pipeline.unet = unet
-        
+
         self.unet = unet
-        
+
+        # Enables build_temporal_attention_mask/apply_temporal_attention_mask
+        # (used by _predict_v when mask_history_from_peek is set) -- a no-op
+        # patch when never applied, see attention_masks.py.
+        patch_temporal_attention_masking(self.unet)
+
         # print("Attn processor:", type(self.unet.attn_processors[list(self.unet.attn_processors.keys())[0]]))
         
         self.vae = self.pipeline.vae
@@ -282,7 +288,7 @@ class CrtlWorld(nn.Module):
         
     
     
-    def _predict_v(self, x_t_full, t, dt_base, action_hidden, added_time_ids, condition_latent, num_history, return_logvar: bool = False):
+    def _predict_v(self, x_t_full, t, dt_base, action_hidden, added_time_ids, condition_latent, num_history, return_logvar: bool = False, overlap_k: int = 0, overlap_active: bool = False):
         """
         convert EDM diffusion to flow-matching v-prediction
         x_t_full: (B, F, C, H, W)  where F = num_history + num_frames
@@ -290,6 +296,13 @@ class CrtlWorld(nn.Module):
                 future part is the shortcut x_t (interpolated between x0 and x1)
         t:       (B,) float in [0,1]
         dt_base: (B,) int (like in shortcut code), OPTIONAL but recommended
+        overlap_k: size of the history-future-overlap peek segment already
+            spliced into x_t_full's history block (0 = no peek segment
+            reserved at all -- the pre-mask_history_from_peek default).
+            Ignored (no mask applied) when overlap_k == 0.
+        overlap_active: whether that peek segment holds real content this
+            call (True) or is a zero-padded placeholder (False) -- only
+            meaningful when overlap_k > 0. See attention_masks.py.
         """
         # breakpoint()
         device = self.unet.device
@@ -324,6 +337,17 @@ class CrtlWorld(nn.Module):
             distance = None
         
         # prediction from edm
+        mask = None
+        if overlap_k > 0:
+            mask = build_temporal_attention_mask(
+                batch_size=B,
+                true_hist_len=num_history - overlap_k,
+                max_overlap_slots=overlap_k,
+                overlap_active=overlap_active,
+                num_target=input_latents.shape[1] - num_history,
+                device=device,
+            )
+        apply_temporal_attention_mask(self.unet, mask)
         unet_out = self.unet(input_latents, c_noise, distance=distance, encoder_hidden_states=action_hidden, added_time_ids=added_time_ids, frame_level_cond=self.args.frame_level_cond)
         model_pred = unet_out.sample
         logvar_out = unet_out.logvar  # (B, F_total, 1, H, W) or None
@@ -418,33 +442,65 @@ class CrtlWorld(nn.Module):
         # latents[:, num_history:]/action[:, num_history:] block is preserved verbatim and
         # simply relocated to start at the new, larger num_history offset.
         overlap_k = 0
+        overlap_active = False
+        mask_history_from_peek = getattr(self.args, 'mask_history_from_peek', False)
         p_hfo = getattr(self.args, 'p_history_future_overlap', 0.0)
-        if p_hfo > 0.0 and torch.rand(1).item() < p_hfo:
-            overlap_k = random.randint(1, self.args.num_frames - 1)
+        if p_hfo > 0.0:
+            overlap_active = torch.rand(1).item() < p_hfo
+            if mask_history_from_peek:
+                # Fixed-length sequence regardless of overlap_active -- see
+                # config.py's mask_history_from_peek docstring. Always
+                # reserve the max overlap window so total sequence length
+                # (and therefore every frame's position embedding --
+                # attention_masks.py's module docstring) never depends on
+                # whether the peek is real this step.
+                overlap_k = self.args.num_frames - 1
+            elif overlap_active:
+                if getattr(self.args, 'fixed_overlap_k', False):
+                    # Always peek the full future window instead of a random
+                    # prefix -- matches the eval-time default (epi_overlap_k=0
+                    # -> num_frames-1). See config.py's fixed_overlap_k docstring.
+                    overlap_k = self.args.num_frames - 1
+                else:
+                    overlap_k = random.randint(1, self.args.num_frames - 1)
+
+        if overlap_k > 0:
             orig_current = latents[:, num_history:num_history + 1].clone()
-            overlap_latents = latents[:, num_history + 1 : num_history + 1 + overlap_k]
-            overlap_action = action[:, num_history + 1 : num_history + 1 + overlap_k]
 
-            # False-future augmentation: with probability p_false_future (drawn
-            # per-sample in dataset.py), replace the peeked overlap frames with
-            # a mismatched future from a different episode. The diffusion
-            # target below (latents[:, num_history:]) is untouched -- always
-            # the true continuation -- so this breaks the "peek == answer"
-            # shortcut instead of adding a new loss term. See config.py's
-            # p_false_future docstring.
-            if 'false_future_latent' in batch:
-                use_ff = batch['use_false_future'].to(device).view(-1, 1, 1, 1, 1)
-                false_latents = batch['false_future_latent'][:, :overlap_k].to(device)
-                overlap_latents = torch.where(use_ff, false_latents, overlap_latents)
+            if overlap_active:
+                overlap_latents = latents[:, num_history + 1 : num_history + 1 + overlap_k]
+                overlap_action = action[:, num_history + 1 : num_history + 1 + overlap_k]
 
-            # Zero the overlap slot's action conditioning (both true- and
-            # false-peek cases) -- the correct future action is already
-            # present, unmodified, at the true target position below, so a
-            # real action here is redundant and would give an action<->frame
-            # consistency shortcut. See config.py's zero_overlap_action
-            # docstring; inference call sites must match via --overlap_zero_action.
-            if getattr(self.args, 'zero_overlap_action', False):
-                overlap_action = torch.zeros_like(overlap_action)
+                # False-future augmentation: with probability p_false_future (drawn
+                # per-sample in dataset.py), replace the peeked overlap frames with
+                # a mismatched future from a different episode. The diffusion
+                # target below (latents[:, num_history:]) is untouched -- always
+                # the true continuation -- so this breaks the "peek == answer"
+                # shortcut instead of adding a new loss term. See config.py's
+                # p_false_future docstring.
+                if 'false_future_latent' in batch:
+                    use_ff = batch['use_false_future'].to(device).view(-1, 1, 1, 1, 1)
+                    false_latents = batch['false_future_latent'][:, :overlap_k].to(device)
+                    overlap_latents = torch.where(use_ff, false_latents, overlap_latents)
+
+                # Zero the overlap slot's action conditioning (both true- and
+                # false-peek cases) -- the correct future action is already
+                # present, unmodified, at the true target position below, so a
+                # real action here is redundant and would give an action<->frame
+                # consistency shortcut. See config.py's zero_overlap_action
+                # docstring; inference call sites must match via --overlap_zero_action.
+                if getattr(self.args, 'zero_overlap_action', False):
+                    overlap_action = torch.zeros_like(overlap_action)
+            else:
+                # mask_history_from_peek's padding case: the overlap branch
+                # didn't fire this step, so there's no real peek content --
+                # the reserved slots carry no visual or action information
+                # regardless of zero_overlap_action above (a padding slot
+                # has no valid action data to begin with), and
+                # attention_masks.py's mask additionally excludes them from
+                # every other frame's attention (see build_temporal_attention_mask).
+                overlap_latents = torch.zeros_like(latents[:, num_history + 1 : num_history + 1 + overlap_k])
+                overlap_action = torch.zeros_like(action[:, num_history + 1 : num_history + 1 + overlap_k])
 
             latents = torch.cat([latents[:, :num_history], overlap_latents, latents[:, num_history:]], dim=1)
             action = torch.cat([action[:, :num_history], overlap_action, action[:, num_history:]], dim=1)
@@ -621,6 +677,15 @@ class CrtlWorld(nn.Module):
             condition_latent=condition_latent,
             num_history=num_history,
             return_logvar=True,
+            # Gate on mask_history_from_peek explicitly, not just overlap_k's
+            # truthiness -- overlap_k is also nonzero for the *legacy*,
+            # unmasked history-future-overlap path (mask_history_from_peek=
+            # False), which must keep getting mask=None inside _predict_v to
+            # avoid silently changing droid_flow_matching_uq_future_overlap_v1/
+            # droid_flow_matching_uq_false_future_v1/v2's already-trained,
+            # unmasked behavior.
+            overlap_k=overlap_k if mask_history_from_peek else 0,
+            overlap_active=overlap_active,
         )
         # breakpoint()
         if self.use_weights:

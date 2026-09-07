@@ -132,9 +132,19 @@ class LiberoWMArgs:
     # signal, matching the near-clean self-generated frames the checkpoint
     # will be fed at inference-time pass 2.
     history_overlap_noise_scale: float = 0.05
+    # If True, the history-future-overlap branch always peeks the maximum
+    # num_frames-1 future frames (overlap_k = num_frames - 1) instead of
+    # drawing overlap_k ~ randint(1, num_frames-1) per step. Matches the
+    # eval-time default (epi_overlap_k=0 -> num_frames-1 in
+    # run_droid_hardware_active_uq.py / replay_libero_wm_traj.py), removing a
+    # train/eval mismatch in how much of the future window gets peeked.
+    # Default False preserves the random-overlap_k behavior of
+    # droid_flow_matching_uq_future_overlap_v1 and
+    # droid_flow_matching_uq_false_future_v1.
+    fixed_overlap_k: bool = False
     # Conditional on the history-future-overlap branch firing: with this
     # probability, replace the peeked future frames with a mismatched future
-    # drawn from a different episode instead of the true continuation. Breaks
+    # drawn from a DIFFERENT episode instead of the true continuation. Breaks
     # the "peek == answer" shortcut that let the logvar head learn
     # content-independent confidence (see droid_flow_matching_uq_future_overlap_v1's
     # known collapse -- near-uniform overconfidence regardless of whether the
@@ -144,8 +154,34 @@ class LiberoWMArgs:
     # the TRUE target future regardless -- so a false peek naturally produces
     # higher prediction error and, via the existing NLL uq_loss, higher
     # predicted uncertainty, with no new loss term needed.
+    # Combines with p_shifted_future below: p_false_future + p_shifted_future
+    # is the total probability that the peek is NOT the true future.
     # Only meaningful when p_history_future_overlap > 0. 0.0 = disabled.
     p_false_future: float = 0.0
+    # Conditional on the history-future-overlap branch firing: with this
+    # probability, replace the peeked future frames with a temporally-SHIFTED
+    # future from the SAME episode -- a num_frames-1-length window starting
+    # at least shifted_future_min_gap and at most shifted_future_max_gap
+    # frames beyond the true peeked window (frame_now+1..frame_now+overlap_k)
+    # -- instead of either the true continuation or a different episode.
+    # Same scene/robot/objects as the true peek, just the wrong point in
+    # time: a harder distractor than p_false_future's other-episode case,
+    # while still being a clear temporal/action mismatch. If the episode is
+    # too short to fit a valid shifted window, falls back to the
+    # p_false_future other-episode path for that sample. Implemented
+    # entirely in dataset.py (sources the shifted window from the SAME
+    # episode's already-loaded annotation/latents); spliced into
+    # CrtlWorld.forward() via the same false_future_latent/use_false_future
+    # mechanism used for p_false_future, so no forward() changes needed
+    # beyond what p_false_future already required. Only meaningful when
+    # p_history_future_overlap > 0. 0.0 = disabled (backward-compatible).
+    p_shifted_future: float = 0.0
+    # Bounds (in rgb-id / WM-rate frame units, i.e. the same units as
+    # frame_now) on how far beyond the true peeked window the shifted-future
+    # window's start is drawn from, uniformly at random. Only used when
+    # p_shifted_future > 0.
+    shifted_future_min_gap: int = 5
+    shifted_future_max_gap: int = 30
     # If True, zero the action conditioning at the overlap slot (both true-
     # and false-peek cases) instead of leaving the real trajectory's action
     # there. The correct future action is always separately available at the
@@ -158,6 +194,42 @@ class LiberoWMArgs:
     # must be evaluated with a matching --overlap_zero_action flag, since v1
     # was trained with a real action there.
     zero_overlap_action: bool = False
+    # If True, always reserve `num_frames - 1` peek slots in the frame
+    # sequence -- whether or not the overlap branch fires this step -- and
+    # apply a temporal-attention mask (see
+    # openworld/world_models/ctrl_world/attention_masks.py) isolating true
+    # history from the peek segment. Fixes two confounds that otherwise ride
+    # along with the pass-1 (no peek) / pass-2 (with peek) comparison
+    # uq_epi_mode="future_overlap" is built on, both stemming from the two
+    # cases using different total sequence lengths today: (1) fully
+    # unmasked, bidirectional temporal self-attention lets true-history's
+    # own token representations shift merely from having more/fewer
+    # keys/values in the softmax, independent of the peek's content; (2)
+    # TransformerSpatioTemporalModel's position embedding is built from
+    # torch.arange(num_frames) where num_frames is the current total
+    # sequence length, so the same conceptual target frame gets a different
+    # absolute position embedding depending on whether the peek is present.
+    # When True: true-history and peek are each sealed to their own block --
+    # neither can attend to the other (symmetric: true-history never sees
+    # peek, and peek never sees true-history either), refining their
+    # representations only from their own raw content; the target attends to
+    # everything, same as an unmasked model would. Neither conditioning
+    # segment needs to reconcile itself against the other via attention --
+    # only target needs to compare them, so target is the one segment that
+    # reads across blocks.
+    # When the peek is a zero-padded placeholder (branch didn't fire this
+    # step), it is additionally masked from every other frame including the
+    # target, and its action conditioning is zeroed regardless of
+    # zero_overlap_action above (a padding slot has no valid action data,
+    # and action conditioning is a separate cross-attention pathway the
+    # temporal-attention mask does nothing to block). Only meaningful when
+    # p_history_future_overlap > 0. Default False preserves
+    # droid_flow_matching_uq_future_overlap_v1/droid_flow_matching_uq_false_future_v1/v2's
+    # variable-length, unmasked behavior -- scripts/replay_libero_wm_traj.py
+    # and run_droid_hardware_active_uq.py must be evaluated with a matching
+    # --mask_history_from_peek flag, since earlier checkpoints were never
+    # trained with a fixed-length sequence or any masking.
+    mask_history_from_peek: bool = False
 
     flow_map_loss_type: str = "lsd"
     psd_sample_mode: str = "uniform"
@@ -183,10 +255,20 @@ class LiberoWMArgs:
                 "rather than dataset.py, so relaxing this to allow composition later is a "
                 "one-line change -- remove this check -- once each effect is validated alone.)"
             )
-        if self.p_false_future > 0.0 and self.p_history_future_overlap <= 0.0:
+        if (self.p_false_future > 0.0 or self.p_shifted_future > 0.0) and self.p_history_future_overlap <= 0.0:
             raise ValueError(
-                "p_false_future is only meaningful when p_history_future_overlap > 0 "
-                "(it replaces the overlap-peek content conditionally on that branch firing)."
+                "p_false_future/p_shifted_future are only meaningful when p_history_future_overlap > 0 "
+                "(they replace the overlap-peek content conditionally on that branch firing)."
+            )
+        if self.p_false_future + self.p_shifted_future > 1.0:
+            raise ValueError(
+                "p_false_future + p_shifted_future must be <= 1.0 -- their sum is the total "
+                "probability that the overlap peek is NOT the true future."
+            )
+        if self.mask_history_from_peek and self.p_history_future_overlap <= 0.0:
+            raise ValueError(
+                "mask_history_from_peek is only meaningful when p_history_future_overlap > 0 "
+                "(there's no peek segment to reserve/mask otherwise)."
             )
         self.output_dir = f"checkpoints/wm_libero/{self.tag}"
         self.wandb_run_name = self.tag

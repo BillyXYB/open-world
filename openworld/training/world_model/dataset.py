@@ -206,19 +206,51 @@ class LiberoLatentDataset(Dataset):
             cam_latent = self._load_latent_video(video_path, rgb_id)
             latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
 
-        # False-future augmentation: with probability p_false_future, load a
-        # mismatched future clip from a different (randomly chosen) episode.
-        # Spliced into the history-future-overlap context in CrtlWorld.forward()
-        # in place of the true peeked future -- the diffusion target stays the
-        # real continuation of THIS episode, so the model must learn to judge
+        # False/shifted-future augmentation: conditional on the
+        # history-future-overlap branch firing (config.py's
+        # p_history_future_overlap), replace the peeked future frames with
+        # either (a) a temporally-SHIFTED window from the SAME episode
+        # (p_shifted_future), or (b) a mismatched future from a DIFFERENT
+        # episode entirely (p_false_future). Spliced into the
+        # history-future-overlap context in CrtlWorld.forward() in place of
+        # the true peeked future -- the diffusion target stays the real
+        # continuation of THIS episode, so the model must learn to judge
         # whether the peeked content is actually plausible instead of just
-        # trusting "peek == answer". See config.py's p_false_future docstring.
+        # trusting "peek == answer". See config.py's
+        # p_false_future/p_shifted_future docstrings.
+        p_shift = getattr(self.args, 'p_shifted_future', 0.0)
         p_ff = getattr(self.args, 'p_false_future', 0.0)
-        use_false_future = p_ff > 0.0 and random.random() < p_ff
+        r = random.random()
+        use_shifted_future = p_shift > 0.0 and r < p_shift
+        use_other_future = (not use_shifted_future) and p_ff > 0.0 and r < p_shift + p_ff
         false_future_latent = torch.zeros(
             (self.args.num_frames - 1, 4, total_h, latent_w), dtype=torch.float32
         )
-        if use_false_future:
+
+        if use_shifted_future:
+            # Window of num_frames-1 frames starting at least min_gap (and at
+            # most max_gap) frames beyond the true peeked window
+            # (frame_now+1..frame_now+num_frames-1) -- same episode, wrong
+            # point in time.
+            min_gap = int(getattr(self.args, 'shifted_future_min_gap', 5))
+            max_gap = int(getattr(self.args, 'shifted_future_max_gap', 30))
+            gap = random.randint(min_gap, max(min_gap, max_gap))
+            shift_start = frame_now + (self.args.num_frames - 1) + gap
+            shifted_rgb_id = [shift_start + i for i in range(self.args.num_frames - 1)]
+            if shifted_rgb_id[-1] > frame_len:
+                # Episode too short for a valid shifted window -- fall back
+                # to the other-episode distractor path so this sample still
+                # gets a false peek (preserving the configured total false
+                # rate) instead of silently reverting to the true future.
+                use_shifted_future = False
+                use_other_future = True
+            else:
+                for cam_idx in range(self.args.num_cams):
+                    video_path = os.path.join(dataset_dir, cam_specs[cam_idx]["latent_video_path"])
+                    cam_latent = self._load_latent_video(video_path, shifted_rgb_id)
+                    false_future_latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
+
+        if use_other_future:
             j = index
             for _ in range(5):  # avoid accidentally picking the same episode
                 j = random.randrange(len(samples))
@@ -239,6 +271,8 @@ class LiberoLatentDataset(Dataset):
                 video_path = os.path.join(distractor_dir, distractor_cam_specs[cam_idx]["latent_video_path"])
                 cam_latent = self._load_latent_video(video_path, distractor_rgb_id)
                 false_future_latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
+
+        use_false_future = use_shifted_future or use_other_future
 
         # Action conditioning: cartesian + gripper.
         cart = np.asarray(label["observation.state.cartesian_position"], dtype=np.float32)[
