@@ -193,6 +193,17 @@ def replay_episode(
     overlap_zero_action: bool = False,  # uq_epi_mode="future_overlap" only: zero the overlap slot's action
                                          # conditioning instead of the real candidate action -- must match
                                          # the checkpoint's zero_overlap_action training setting.
+    mask_history_from_peek: bool = False,  # must match the checkpoint's mask_history_from_peek training
+                                            # setting -- see config.py's docstring. When True: pass-1 ALSO
+                                            # reserves num_frames-1 zero-padded, fully-masked peek slots (so
+                                            # its sequence length matches pass-2's, fixing a positional-
+                                            # embedding confound between the two -- see attention_masks.py's
+                                            # module docstring), and pass-2's future_overlap peek is masked so
+                                            # true-history can't attend to it.
+    epi_overlap_content: str = "pass1_pred",  # uq_epi_mode="future_overlap" only: "pass1_pred" (default,
+                                               # normal behavior) or "repeat_last_hist" -- a content-free
+                                               # peek diagnostic, see the false_future attention-masking
+                                               # plan's Phase 0 (does NOT require mask_history_from_peek).
     on_chunk=None,                  # Callable[[int,int,list,list,list,list,list,float|None,float|None],None] | None
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[torch.Tensor],
            torch.Tensor | None, list[torch.Tensor]]:
@@ -246,6 +257,32 @@ def replay_episode(
         current = rolled[rgb_id[num_history]].unsqueeze(0).to(device)
         action = torch.tensor(action_norm[state_id], dtype=torch.float32).unsqueeze(0).to(device)
 
+        # mask_history_from_peek: pass-1 ALSO reserves num_frames-1 zero-padded
+        # peek slots -- spliced between history and current/future, mirroring
+        # training's splice order -- so its total sequence length (and hence
+        # every frame's position embedding) matches pass-2's below. `action`
+        # mirrors `history`'s splice since it must cover the same total frame
+        # count (action_encoder produces one embedding per frame). See
+        # attention_masks.py's module docstring.
+        # Only meaningful when uq_epi_mode=="future_overlap" -- that's the
+        # only pass-2 construction below whose own history2 gets this same
+        # padding (see the future_overlap branch further down), and it's the
+        # only mode a mask_history_from_peek-trained checkpoint's masking
+        # behavior actually corresponds to. Other modes' history2 (zero/flat/
+        # single_history/iterative) stay at their original, unpadded length
+        # regardless of this flag -- padding pass-1 without also padding
+        # those would just reintroduce the same length mismatch this flag
+        # exists to remove.
+        max_overlap_slots = num_frames - 1
+        if mask_history_from_peek and uq_epi_mode == "future_overlap":
+            pad_latents = torch.zeros(1, max_overlap_slots, *history.shape[2:], dtype=history.dtype, device=device)
+            history_p1 = torch.cat([history, pad_latents], dim=1)
+            pad_action = torch.zeros(1, max_overlap_slots, action.shape[-1], dtype=action.dtype, device=device)
+            action_p1 = torch.cat([action[:, :num_history], pad_action, action[:, num_history:]], dim=1)
+        else:
+            history_p1 = history
+            action_p1 = action
+
         # Shared seed for pass 1 / pass 2: a fresh torch.Generator per call
         # (not one shared object reused across both __call__s, which would
         # advance its state between calls and defeat the point) so the two
@@ -258,11 +295,11 @@ def replay_episode(
 
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             action_latent = model.action_encoder(
-                action, [text], model.tokenizer, model.text_encoder, args.frame_level_cond)
+                action_p1, [text], model.tokenizer, model.text_encoder, args.frame_level_cond)
             result = pipeline_cls.__call__(
                 pipeline, image=current, text=action_latent,
                 width=args.width, height=int(args.num_cams * args.height),
-                num_frames=num_frames, history=history,
+                num_frames=num_frames, history=history_p1,
                 num_inference_steps=num_inference_steps, decode_chunk_size=args.decode_chunk_size,
                 max_guidance_scale=args.guidance_scale, fps=args.fps,
                 motion_bucket_id=args.motion_bucket_id, mask=None,
@@ -270,6 +307,8 @@ def replay_episode(
                 frame_level_cond=args.frame_level_cond, his_cond_zero=args.his_cond_zero,
                 flow_map_type=args.flow_map_type, flow_map_loss_type=args.flow_map_loss_type,
                 return_uncertainty=use_uq, generator=gen1,
+                overlap_k=max_overlap_slots if (mask_history_from_peek and uq_epi_mode == "future_overlap") else 0,
+                overlap_active=False,  # pass-1 never has a real peek
             )
         if use_uq:
             _, pred_latents, logvar_steps, vel_steps = result
@@ -300,9 +339,36 @@ def replay_episode(
                 # Splice pass-1's OWN predicted future frames into history, keep current
                 # UNCHANGED, and re-predict the SAME target range (mirrors training's
                 # p_history_future_overlap augmentation in CrtlWorld.forward()).
-                overlap_k_used = epi_overlap_k if epi_overlap_k > 0 else (num_frames - 1)
-                overlap_k_used = max(1, min(overlap_k_used, num_frames - 1))
-                overlap_frames = pred[1:1 + overlap_k_used].unsqueeze(0).to(device)  # pred = pass-1 output
+                if mask_history_from_peek:
+                    # A mask_history_from_peek checkpoint was trained with
+                    # fixed_overlap_k forced True (see flow_map_ctrl_world.py's
+                    # forward()) -- i.e. it has NEVER seen anything other than
+                    # the full max_overlap_slots peek window, unlike older
+                    # future_overlap/false_future checkpoints where
+                    # fixed_overlap_k=False made the epi_overlap_k sweep
+                    # meaningful. Force the max here (and ignore a smaller
+                    # epi_overlap_k) so overlap_k_used stays equal to
+                    # max_overlap_slots -- matching pass-1's padded length
+                    # above, which is REQUIRED for the fixed-length invariant
+                    # this flag exists to provide.
+                    if 0 < epi_overlap_k < max_overlap_slots:
+                        print(f"[wm] WARNING: --epi_overlap_k={epi_overlap_k} ignored -- "
+                              f"mask_history_from_peek forces the full max_overlap_slots={max_overlap_slots}.")
+                    overlap_k_used = max_overlap_slots
+                else:
+                    overlap_k_used = epi_overlap_k if epi_overlap_k > 0 else (num_frames - 1)
+                    overlap_k_used = max(1, min(overlap_k_used, num_frames - 1))
+                if epi_overlap_content == "repeat_last_hist":
+                    # Diagnostic: a content-free peek (the true history's own
+                    # last frame, repeated) -- carries no new visual
+                    # information, so any measured pass-1/pass-2 divergence
+                    # in this mode is entirely the attention-renormalization/
+                    # positional-embedding artifact this plan's masking fix
+                    # targets, not genuine epistemic signal. See the
+                    # false_future attention-masking plan's Phase 0.
+                    overlap_frames = history[:, -1:, :, :, :].expand(-1, overlap_k_used, -1, -1, -1).to(device)
+                else:
+                    overlap_frames = pred[1:1 + overlap_k_used].unsqueeze(0).to(device)  # pred = pass-1 output
                 history2 = torch.cat([history, overlap_frames], dim=1)
                 current2, his_cond_zero2 = current, False  # MUST reuse pass-1's `current` verbatim -- target range/current frame unchanged; do not recompute
                 if overlap_zero_action:
@@ -333,6 +399,12 @@ def replay_episode(
                     frame_level_cond=args.frame_level_cond, his_cond_zero=his_cond_zero2,
                     flow_map_type=args.flow_map_type, flow_map_loss_type=args.flow_map_loss_type,
                     return_uncertainty=use_uq, generator=gen2,
+                    # Real peek content this call iff mask_history_from_peek AND
+                    # this is the future_overlap mode -- other modes' history2
+                    # constructions above aren't a history+peek splice at all,
+                    # so masking doesn't apply to them regardless of this flag.
+                    overlap_k=(overlap_k_used if (mask_history_from_peek and uq_epi_mode == "future_overlap") else 0),
+                    overlap_active=(mask_history_from_peek and uq_epi_mode == "future_overlap"),
                 )
             if use_uq:
                 _, pred_latents2, logvar_steps2, vel_steps2 = result2
@@ -762,6 +834,17 @@ def main() -> None:
                    help="Overlap width k for uq_epi_mode=future_overlap; 0 (default) = "
                         "num_frames-1 (max overlap, uses all of pass-1's predicted future "
                         "as pass-2 context). Must be in [1, num_frames-1].")
+    p.add_argument("--epi_overlap_content", default="pass1_pred",
+                   choices=["pass1_pred", "repeat_last_hist"],
+                   help="For uq_epi_mode=future_overlap: 'pass1_pred' (default) is normal "
+                        "behavior -- the peek is pass-1's own predicted future. "
+                        "'repeat_last_hist' is a diagnostic that replaces the peek with a "
+                        "content-free copy of true history's own last frame, to measure how "
+                        "much of the pass-1/pass-2 divergence is an attention-renormalization/"
+                        "positional-embedding artifact rather than genuine epistemic signal -- "
+                        "see the false_future attention-masking plan's Phase 0. Does not "
+                        "require --mask_history_from_peek (that fixes the artifact; this "
+                        "measures how large it is beforehand).")
     p.add_argument("--overlap_zero_action", action="store_true",
                    help="For uq_epi_mode=future_overlap: zero the action conditioning at the "
                         "overlap slot instead of using the real candidate action. Must match "
@@ -769,6 +852,18 @@ def main() -> None:
                         "checkpoints trained with zero_overlap_action=True (e.g. "
                         "droid_flow_matching_uq_false_future_v1), leave unset for "
                         "droid_flow_matching_uq_future_overlap_v1 and earlier.")
+    p.add_argument("--mask_history_from_peek", action="store_true",
+                   help="For uq_epi_mode=future_overlap: mask temporal attention so true-history "
+                        "and peek are each sealed to their own block (neither attends to the "
+                        "other -- symmetric), and give pass-1 the same fixed-length, zero-padded "
+                        "peek slots pass-2 uses -- "
+                        "fixing two confounds (attention renormalization + a positional-embedding "
+                        "shift, see attention_masks.py's module docstring) in the pass-1/pass-2 "
+                        "comparison this uq_epi_mode is built on. Must match the checkpoint's "
+                        "mask_history_from_peek training setting -- set this for checkpoints "
+                        "trained with mask_history_from_peek=True (e.g. "
+                        "droid_flow_matching_uq_false_future_v3), leave unset for v1/v2 and "
+                        "earlier (never trained with a masked, fixed-length sequence).")
     p.add_argument("--manifest", default=None,
                    help="Path to test_manifest_by_cell.json for cell-balanced episode selection.")
     p.add_argument("--max_episodes_per_cell", type=int, default=0,
@@ -902,6 +997,8 @@ def main() -> None:
                 a.num_inference_steps, a.skip, max_chunks,
                 use_uq=use_uq, uq_epi_mode=a.uq_epi_mode, epi_overlap_k=a.epi_overlap_k,
                 overlap_zero_action=a.overlap_zero_action,
+                mask_history_from_peek=a.mask_history_from_peek,
+                epi_overlap_content=a.epi_overlap_content,
                 on_chunk=_make_on_chunk(suite, ep_id, cell))
         except RuntimeError as e:
             print(f"[replay]   skipped: {e}")
