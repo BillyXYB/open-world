@@ -85,6 +85,14 @@ def import_bundle(bundle_path: Path, *, data_root: Path, suite: str, split: str,
             "source": "hand_collected_manual_uq_check",
             "source_bundle": str(bundle_path),
             "original_episode_id": meta.get("episode_id"),
+            # Human-labeled UQ ground truth carried through from the GELLO collection
+            # prompt (see droid/scripts/convert/export_episode_for_wm_uq.py), when present.
+            # "uncertainty_cell" reuses the generic field name replay_libero_wm_traj.py /
+            # aggregate_uq_by_cell.py / plot_uq_by_cell.py already group metrics by.
+            "uncertainty_cell": meta.get("quadrant"),
+            "quadrant": meta.get("quadrant"),
+            "aleatoric_level": meta.get("aleatoric_level"),
+            "epistemic_level": meta.get("epistemic_level"),
         },
     )
     print(f"[*] Imported '{bundle_path.name}' -> {suite}/{split}/{episode_id} (task='{meta['language']}')")

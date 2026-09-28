@@ -200,6 +200,16 @@ def replay_episode(
                                             # embedding confound between the two -- see attention_masks.py's
                                             # module docstring), and pass-2's future_overlap peek is masked so
                                             # true-history can't attend to it.
+    history_source: str = "rolled",        # "rolled" (default) = closed-loop: history/current come from
+                                            # the running buffer, which gets overwritten with this
+                                            # trajectory's own predictions as chunks proceed, so errors
+                                            # compound chunk to chunk. "gt" = every chunk's history/current
+                                            # is read straight from latent_gt instead, so chunks never see
+                                            # each other's predictions -- equivalent to slicing the episode
+                                            # into many independent (true-history, true-future) windows and
+                                            # replaying each open-loop / teacher-forced. Doesn't change
+                                            # future_overlap's pass-2 peek, which is pass-1's own prediction
+                                            # by design regardless of this flag.
     epi_overlap_content: str = "pass1_pred",  # uq_epi_mode="future_overlap" only: "pass1_pred" (default,
                                                # normal behavior) or "repeat_last_hist" -- a content-free
                                                # peek diagnostic, see the false_future attention-masking
@@ -253,8 +263,11 @@ def replay_episode(
         rgb_id = build_frame_ids(frame_now, num_history, num_frames, skip, skip_his)
         state_id = [min(max(r, 0), T - 1) for r in rgb_id]  # action at same frame as latent
 
-        history = torch.stack([rolled[rgb_id[i]] for i in range(num_history)], 0).unsqueeze(0).to(device)
-        current = rolled[rgb_id[num_history]].unsqueeze(0).to(device)
+        # history_source="gt" reads straight from latent_gt so this chunk is
+        # conditionally independent of every other chunk's predictions.
+        _src = latent_gt if history_source == "gt" else rolled
+        history = torch.stack([_src[rgb_id[i]] for i in range(num_history)], 0).unsqueeze(0).to(device)
+        current = _src[rgb_id[num_history]].unsqueeze(0).to(device)
         action = torch.tensor(action_norm[state_id], dtype=torch.float32).unsqueeze(0).to(device)
 
         # mask_history_from_peek: pass-1 ALSO reserves num_frames-1 zero-padded
@@ -881,6 +894,15 @@ def main() -> None:
                    help="Fallback native fps when the annotation JSON has no 'fps' key "
                         "(LIBERO collected data always has one; DROID's droid_ctrl_world "
                         "never does — pass e.g. 5 there so the restride below is a no-op).")
+    p.add_argument("--history_source", default="rolled", choices=["rolled", "gt"],
+                   help="'rolled' (default) = closed-loop autoregressive rollout: each chunk's "
+                        "history/current come from the buffer of this trajectory's OWN prior "
+                        "predictions, so errors compound across chunks. 'gt' = every chunk's "
+                        "history/current is read from the true trajectory instead, making chunks "
+                        "conditionally independent -- equivalent to splitting the episode into "
+                        "many separate (true-history, true-future) windows and replaying each "
+                        "open-loop/teacher-forced. Does not affect future_overlap's pass-2 peek, "
+                        "which is always pass-1's own predicted future by design.")
     a = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -932,7 +954,17 @@ def main() -> None:
             if a.num_episodes > 0:
                 ep_ids = ep_ids[:a.num_episodes]
             for ep_id in ep_ids:
-                episode_list.append((suite, ep_id, None))
+                # No --manifest: fall back to whatever uncertainty_cell the episode's
+                # own annotation carries (e.g. hand-labeled quadrants written by
+                # import_manual_droid_episode.py), so per-chunk/per-episode metrics
+                # are still groupable without curating a manifest for a handful of
+                # episodes. Suites with no such field (e.g. droid_ctrl_world) just
+                # get cell=None, same as before.
+                ann_path = Path(a.data_root) / suite / "annotation" / a.split / f"{ep_id}.json"
+                cell = None
+                if ann_path.exists():
+                    cell = json.loads(ann_path.read_text()).get("uncertainty_cell")
+                episode_list.append((suite, ep_id, cell))
 
     # Open streaming JSONL for per-chunk metrics (append mode so resuming works)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -999,6 +1031,7 @@ def main() -> None:
                 overlap_zero_action=a.overlap_zero_action,
                 mask_history_from_peek=a.mask_history_from_peek,
                 epi_overlap_content=a.epi_overlap_content,
+                history_source=a.history_source,
                 on_chunk=_make_on_chunk(suite, ep_id, cell))
         except RuntimeError as e:
             print(f"[replay]   skipped: {e}")
