@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import random
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -97,6 +98,14 @@ class LiberoLatentDataset(Dataset):
             raise RuntimeError("No LIBERO datasets found.")
         self.max_id = max(self.samples_len)
 
+        # Index-aligned with samples_all/dataset_path_all/norm_all -- lets
+        # __getitem__ recover which sub-dataset a sample came from (needed to
+        # key into the bootstrap-future cache, which is laid out per
+        # dataset_name; see p_bootstrap_future's docstring in config.py).
+        self.dataset_names_all: list[str] = dataset_names
+        bootstrap_cache_root = getattr(args, "bootstrap_cache_root", None)
+        self.bootstrap_cache_root = Path(bootstrap_cache_root) if bootstrap_cache_root else None
+
     def __len__(self) -> int:
         return self.max_id
 
@@ -124,13 +133,23 @@ class LiberoLatentDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _build_frame_ids(self, frame_now: int, frame_len: int,
-                         apply_future_in_history: bool = False) -> tuple[list[int], np.ndarray]:
+                         apply_future_in_history: bool = False) -> tuple[list[int], np.ndarray, int]:
         """Same temporal layout as the DROID loader:
         ``num_history`` frames going back, then ``num_frames`` future frames.
         Random skip with occasional zeroing for history augmentation.
 
         ``apply_future_in_history`` is pre-computed by the caller as part of
-        a joint mode draw (mutually exclusive with single_history)."""
+        a joint mode draw (mutually exclusive with single_history).
+
+        Also returns the drawn ``skip`` (the future-frame stride) -- the
+        caller needs it to key the p_bootstrap_future cache lookup (see
+        __getitem__'s use_bootstrap_future branch) with the SAME skip this
+        sample's own true future uses, so the cached peek's implied
+        timestamps (frame_now + i*skip) match what this sample's true future
+        actually represents at its own cadence, instead of an arbitrary
+        fixed stride (see generate_bootstrap_futures_droid.py, which now
+        generates BOTH skip=1 and skip=2 cache variants per anchor for
+        exactly this reason)."""
         skip = random.randint(1, 2)
         skip_his = int(skip * 4)
         if random.random() < 0.15:
@@ -150,7 +169,42 @@ class LiberoLatentDataset(Dataset):
         rgb_id = np.clip(np.asarray(rgb_id), 0, frame_len).tolist()
         rgb_id = [int(x) for x in rgb_id]
         state_id = np.asarray(rgb_id) * self.args.down_sample
-        return rgb_id, state_id
+        return rgb_id, state_id, skip
+
+    def _sample_other_episode_future(
+        self, samples: list[dict[str, Any]], dataset_path: list[str],
+        sample: dict[str, Any], index: int,
+        total_h: int, per_cam_h: int, latent_w: int,
+    ) -> torch.Tensor:
+        """Load a ``num_frames-1``-length future window from a randomly-chosen
+        DIFFERENT episode in the same sub-dataset -- the p_false_future
+        distractor, also used as the fallback when a shifted-future window
+        doesn't fit or a bootstrap-future cache lookup misses. Factored out
+        of __getitem__ so all three call sites share one implementation."""
+        j = index
+        for _ in range(5):  # avoid accidentally picking the same episode
+            j = random.randrange(len(samples))
+            distractor = samples[j]
+            if distractor["episode_id"] != sample["episode_id"]:
+                break
+        distractor = samples[j]
+        distractor_dir = dataset_path[j]
+        distractor_ann = os.path.join(
+            distractor_dir, self.args.annotation_name, self.mode, f"{distractor['episode_id']}.json"
+        )
+        with open(distractor_ann) as f:
+            distractor_label = json.load(f)
+        distractor_frame_now = int(distractor["frame_ids"][0])
+        distractor_rgb_id = [distractor_frame_now + i for i in range(1, self.args.num_frames)]
+        distractor_cam_specs = distractor_label.get("latent_videos", [])
+        false_future_latent = torch.zeros(
+            (self.args.num_frames - 1, 4, total_h, latent_w), dtype=torch.float32
+        )
+        for cam_idx in range(self.args.num_cams):
+            video_path = os.path.join(distractor_dir, distractor_cam_specs[cam_idx]["latent_video_path"])
+            cam_latent = self._load_latent_video(video_path, distractor_rgb_id)
+            false_future_latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
+        return false_future_latent
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         # Pick a sub-dataset weighted by prob.
@@ -185,8 +239,8 @@ class LiberoLatentDataset(Dataset):
         _do_fih = r < p_fih
         _do_sh = (not _do_fih) and r < p_fih + p_sh
 
-        rgb_id, state_id = self._build_frame_ids(frame_now, frame_len,
-                                                  apply_future_in_history=_do_fih)
+        rgb_id, state_id, sample_skip = self._build_frame_ids(frame_now, frame_len,
+                                                               apply_future_in_history=_do_fih)
 
         # Stack two camera latents vertically along H.
         per_cam_h = self.args.height // 8  # 24 at height=192
@@ -206,23 +260,32 @@ class LiberoLatentDataset(Dataset):
             cam_latent = self._load_latent_video(video_path, rgb_id)
             latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
 
-        # False/shifted-future augmentation: conditional on the
+        # False/shifted/bootstrap-future augmentation: conditional on the
         # history-future-overlap branch firing (config.py's
         # p_history_future_overlap), replace the peeked future frames with
-        # either (a) a temporally-SHIFTED window from the SAME episode
-        # (p_shifted_future), or (b) a mismatched future from a DIFFERENT
-        # episode entirely (p_false_future). Spliced into the
-        # history-future-overlap context in CrtlWorld.forward() in place of
-        # the true peeked future -- the diffusion target stays the real
-        # continuation of THIS episode, so the model must learn to judge
-        # whether the peeked content is actually plausible instead of just
-        # trusting "peek == answer". See config.py's
-        # p_false_future/p_shifted_future docstrings.
+        # one of: (a) a temporally-SHIFTED window from the SAME episode
+        # (p_shifted_future), (b) a mismatched future from a DIFFERENT
+        # episode entirely (p_false_future), or (c) a SELF-SAMPLED synthetic
+        # future generated by the model's own sampler, conditioned on THIS
+        # episode's real history+actions (p_bootstrap_future -- see
+        # scripts/generate_bootstrap_futures_droid.py and config.py's
+        # docstring). Spliced into the history-future-overlap context in
+        # CrtlWorld.forward() in place of the true peeked future -- the
+        # diffusion target stays the real continuation of THIS episode, so
+        # the model must learn to judge whether the peeked content is
+        # actually plausible instead of just trusting "peek == answer". See
+        # config.py's p_false_future/p_shifted_future/p_bootstrap_future
+        # docstrings.
         p_shift = getattr(self.args, 'p_shifted_future', 0.0)
         p_ff = getattr(self.args, 'p_false_future', 0.0)
+        p_bs = getattr(self.args, 'p_bootstrap_future', 0.0)
         r = random.random()
         use_shifted_future = p_shift > 0.0 and r < p_shift
         use_other_future = (not use_shifted_future) and p_ff > 0.0 and r < p_shift + p_ff
+        use_bootstrap_future = (
+            not use_shifted_future and not use_other_future
+            and p_bs > 0.0 and r < p_shift + p_ff + p_bs
+        )
         false_future_latent = torch.zeros(
             (self.args.num_frames - 1, 4, total_h, latent_w), dtype=torch.float32
         )
@@ -250,29 +313,41 @@ class LiberoLatentDataset(Dataset):
                     cam_latent = self._load_latent_video(video_path, shifted_rgb_id)
                     false_future_latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
 
-        if use_other_future:
-            j = index
-            for _ in range(5):  # avoid accidentally picking the same episode
-                j = random.randrange(len(samples))
-                distractor = samples[j]
-                if distractor["episode_id"] != sample["episode_id"]:
-                    break
-            distractor = samples[j]
-            distractor_dir = dataset_path[j]
-            distractor_ann = os.path.join(
-                distractor_dir, self.args.annotation_name, self.mode, f"{distractor['episode_id']}.json"
+        if use_bootstrap_future:
+            dataset_name = self.dataset_names_all[dataset_id]
+            # Keyed by THIS sample's own drawn `sample_skip` (not a fixed
+            # stride) so the cached peek's implied timestamps
+            # (frame_now + i*sample_skip) exactly match what this sample's
+            # true future represents at its own cadence --
+            # generate_bootstrap_futures_droid.py generates BOTH skip=1 and
+            # skip=2 cache variants per covered anchor for exactly this
+            # reason (see its module docstring).
+            cache_path = (
+                self.bootstrap_cache_root / dataset_name / str(sample["episode_id"])
+                / f"{frame_now}_skip{sample_skip}.pt"
             )
-            with open(distractor_ann) as f:
-                distractor_label = json.load(f)
-            distractor_frame_now = int(distractor["frame_ids"][0])
-            distractor_rgb_id = [distractor_frame_now + i for i in range(1, self.args.num_frames)]
-            distractor_cam_specs = distractor_label.get("latent_videos", [])
-            for cam_idx in range(self.args.num_cams):
-                video_path = os.path.join(distractor_dir, distractor_cam_specs[cam_idx]["latent_video_path"])
-                cam_latent = self._load_latent_video(video_path, distractor_rgb_id)
-                false_future_latent[:, :, cam_idx * per_cam_h : (cam_idx + 1) * per_cam_h] = cam_latent
+            if cache_path.exists():
+                false_future_latent = torch.load(cache_path, map_location="cpu").float()
+            else:
+                # Partial-coverage cache (DROID's train split is far too
+                # large for full coverage, unlike push_cube's bootstrap
+                # cache -- see generate_bootstrap_futures_droid.py) -- fall
+                # back to the other-episode distractor so this sample still
+                # gets a false peek at the configured total rate, instead of
+                # silently reverting to the true future. Mirrors the
+                # shifted-window-too-short fallback above. This dilutes the
+                # *realized* p_bootstrap_future rate below its configured
+                # value by roughly the cache miss rate -- worth measuring
+                # (e.g. a periodic hit/miss log) rather than assuming.
+                use_bootstrap_future = False
+                use_other_future = True
 
-        use_false_future = use_shifted_future or use_other_future
+        if use_other_future:
+            false_future_latent = self._sample_other_episode_future(
+                samples, dataset_path, sample, index, total_h, per_cam_h, latent_w
+            )
+
+        use_false_future = use_shifted_future or use_other_future or use_bootstrap_future
 
         # Action conditioning: cartesian + gripper.
         cart = np.asarray(label["observation.state.cartesian_position"], dtype=np.float32)[
