@@ -46,31 +46,19 @@ if [ -z "${CKPT}" ]; then
 fi
 echo "Using checkpoint: ${CKPT}"
 
-DATA_ROOT=/scratch/gpfs/AM43/yy4041/data
-SUITE=droid_manual_uq_check
 OUT_DIR="${CKPT_DIR}/replay_manual_check"
-QUADRANT_CELLS="low_aleatoric/low_epistemic,low_aleatoric/high_epistemic,high_aleatoric/low_epistemic,high_aleatoric/high_epistemic"
 
-# replay_libero_wm_traj.py opens chunk_metrics.jsonl in APPEND mode, so
-# re-submitting this job against the same OUT_DIR would duplicate every prior
-# chunk's rows and skew the per-quadrant aggregation below. Move any existing
-# file aside (never delete) so each submission starts a clean file.
-if [ -f "${OUT_DIR}/chunk_metrics.jsonl" ]; then
-    mv "${OUT_DIR}/chunk_metrics.jsonl" "${OUT_DIR}/chunk_metrics.$(date +%Y%m%d_%H%M%S).jsonl"
-fi
+# DATA_ROOT / STAT_REFERENCE_ROOT / SUITE / SPLIT / BUNDLE_DIR / QUADRANT_CELLS,
+# the SVD+CLIP weight detection, and the import/rotate/aggregate helpers.
+source jobs/_common_manual_check.sh
+
+rotate_chunk_metrics
 
 # ===== IMPORT (one-time per new bundle; safe to re-run, skips existing) =====
-# BUNDLE_DIR should point at the wm_uq_export/ dir you rsynced over from the
-# local DROID collection machine (droid/scripts/convert/export_episode_for_wm_uq.py
-# output) -- either a single episode dir or a parent dir of several.
-: "${BUNDLE_DIR:?Set BUNDLE_DIR to the rsynced wm_uq_export/<episode_id>/ (or parent) directory}"
-uv run scripts/import_manual_droid_episode.py \
-    --bundle_dir "${BUNDLE_DIR}" \
-    --data_root "${DATA_ROOT}" \
-    --suite "${SUITE}" \
-    --split val \
-    --svd_model_path external/stable-video-diffusion-img2vid \
-    --height 192 --width 320
+# BUNDLE_DIR points at the wm_uq_export/ dir rsynced from the local DROID collection
+# machine by droid/scripts/convert/export_and_sync_uq_eval.py -- either a single episode
+# dir or a parent dir of several. It defaults to the path that script syncs to.
+run_manual_check_import
 
 # ===== REPLAY (epistemic UQ: future_overlap / same-range self-consistency) =====
 # Same args as jobs/replay_droid_wm_traj_manual_check.sh (v3 variant) EXCEPT
@@ -79,9 +67,11 @@ uv run scripts/replay_libero_wm_traj.py \
     --checkpoint "${CKPT}" \
     --data_root "${DATA_ROOT}" \
     --suites "${SUITE}" \
-    --split val \
+    --split "${SPLIT}" \
     --stat_root "${DATA_ROOT}/dataset_meta_info" \
     --output_dir "${OUT_DIR}" \
+    --svd_model_path "${SVD_PATH}" \
+    --clip_model_path "${CLIP_PATH}" \
     --num_cams 3 --height 192 --width 320 --down_sample 1 \
     --native_fps_default 15 \
     --history_source gt \
@@ -90,22 +80,10 @@ uv run scripts/replay_libero_wm_traj.py \
     --uq_epi_mode future_overlap \
     --epi_overlap_k 0 \
     --overlap_zero_action \
-    --mask_history_from_peek
+    --mask_history_from_peek \
+    || { echo "ERROR: replay_libero_wm_traj.py failed"; exit 1; }
 
 # ===== PER-QUADRANT AGGREGATION + PLOT =====
-# Groups chunk_metrics.jsonl by the uncertainty_cell each episode's own
-# annotation carries (the hand-picked aleatoric/epistemic quadrant --
-# see replay_libero_wm_traj.py's no-manifest episode-list branch), reusing
-# the same aggregate/plot scripts the LIBERO 2x2 variance/data-scale UQ study
-# uses, via their --cells override.
-uv run scripts/aggregate_uq_by_cell.py \
-    --chunk_jsonl "${OUT_DIR}/chunk_metrics.jsonl" \
-    --cells "${QUADRANT_CELLS}" \
-    --output_dir "${OUT_DIR}/uq_by_quadrant"
-
-uv run scripts/plot_uq_by_cell.py \
-    --csv "${OUT_DIR}/uq_by_quadrant/uq_per_chunk.csv" \
-    --cells "${QUADRANT_CELLS}" \
-    --output_dir "${OUT_DIR}/uq_by_quadrant/plots"
+run_manual_check_aggregation
 
 echo "SLURM job finished at $(date)"
