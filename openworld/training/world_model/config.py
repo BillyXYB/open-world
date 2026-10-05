@@ -213,14 +213,17 @@ class LiberoWMArgs:
     p_bootstrap_future: float = 0.0
     # Root directory of the pre-generated bootstrap-future cache (see
     # scripts/generate_bootstrap_futures_droid.py), laid out as
-    # <bootstrap_cache_root>/<dataset_name>/<episode_id>/<frame_now>.pt
+    # <bootstrap_cache_root>/<dataset_name>/<episode_id>/<frame_now>_skip{1,2}.pt
     # (half-precision latents, shape (num_frames-1, 4, total_h, latent_w)).
     # DROID's train split (~8.7M samples) makes full coverage infeasible
     # (unlike push_cube's bootstrap cache), so this is necessarily a partial
-    # cache: dataset.py falls back to the p_false_future other-episode path
-    # for any (episode_id, frame_now) not found in the cache, preserving the
-    # configured total false-peek rate even though the *realized*
-    # p_bootstrap_future rate will be diluted by the cache miss rate.
+    # cache. dataset.py's __init__ indexes every cached anchor up front
+    # (bootstrap_anchors_all) and, when this branch fires, draws the
+    # training example directly FROM that index instead of checking whether
+    # an independently-drawn row happens to be cached -- so the realized
+    # p_bootstrap_future rate matches the configured value exactly, with no
+    # dilution from partial coverage (only falls back to the
+    # p_false_future other-episode path if the cache is entirely empty).
     # Required when p_bootstrap_future > 0.
     bootstrap_cache_root: str | None = None
     # If True, zero the action conditioning at the overlap slot (both true-

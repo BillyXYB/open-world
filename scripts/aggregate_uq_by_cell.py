@@ -70,10 +70,12 @@ KEY_METRICS = [
 
 
 def aggregate_by_cell(df: pd.DataFrame, numeric_cols: list[str],
-                      count_key: str = "n_rows") -> dict[str, dict]:
+                      count_key: str = "n_rows",
+                      cells: list[str] | None = None) -> dict[str, dict]:
     """Group df by uncertainty_cell and compute mean/std/CVaR95 per numeric column."""
+    cells = cells if cells is not None else CELLS
     cell_agg: dict[str, dict] = {}
-    for cell in CELLS:
+    for cell in cells:
         group = df[df["uncertainty_cell"] == cell]
         if group.empty:
             print(f"[aggregate] WARNING: no rows for cell '{cell}'")
@@ -96,7 +98,9 @@ def aggregate_by_cell(df: pd.DataFrame, numeric_cols: list[str],
     return cell_agg
 
 
-def print_summary_table(cell_agg: dict, numeric_cols: list[str], count_key: str = "n_rows") -> None:
+def print_summary_table(cell_agg: dict, numeric_cols: list[str], count_key: str = "n_rows",
+                        cells: list[str] | None = None) -> None:
+    cells = cells if cells is not None else CELLS
     # KEY_METRICS first, then any remaining numeric cols not in the list
     available = [m for m in KEY_METRICS if m in numeric_cols]
     available += [m for m in numeric_cols if m not in available]
@@ -106,7 +110,7 @@ def print_summary_table(cell_agg: dict, numeric_cols: list[str], count_key: str 
     print()
     print(header)
     print("-" * len(header))
-    for cell in CELLS:
+    for cell in cells:
         agg = cell_agg.get(cell, {})
         n = agg.get(count_key, 0)
         row = f"{cell:35s}"
@@ -129,10 +133,16 @@ def main() -> None:
                    help="Root of UQ 2x2 dataset (to find val annotations; used with --replay_summary)")
     p.add_argument("--output_dir", required=True,
                    help="Directory to write output files")
+    p.add_argument("--cells", default=None,
+                   help="Comma-separated cell/region names to group by, overriding the "
+                        "default 4 variance/data-scale cells (e.g. for a different "
+                        "labeling scheme like aleatoric/epistemic quadrants).")
     a = p.parse_args()
 
     if not a.replay_summary and not a.chunk_jsonl:
         p.error("At least one of --replay_summary or --chunk_jsonl is required.")
+
+    cells = [c.strip() for c in a.cells.split(",") if c.strip()] if a.cells else CELLS
 
     output_dir = Path(a.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -157,13 +167,13 @@ def main() -> None:
         df_chunks.to_csv(csv_path, index=False)
         print(f"[aggregate] wrote {len(df_chunks)} rows → {csv_path}")
 
-        cell_agg_chunks = aggregate_by_cell(df_chunks, numeric_cols_chunk, count_key="n_chunks")
+        cell_agg_chunks = aggregate_by_cell(df_chunks, numeric_cols_chunk, count_key="n_chunks", cells=cells)
 
         json_path = output_dir / "uq_by_cell_chunks.json"
         json_path.write_text(json.dumps(cell_agg_chunks, indent=2))
         print(f"[aggregate] wrote {json_path}")
 
-        print_summary_table(cell_agg_chunks, numeric_cols_chunk, count_key="n_chunks")
+        print_summary_table(cell_agg_chunks, numeric_cols_chunk, count_key="n_chunks", cells=cells)
 
     # ------------------------------------------------------------------ #
     # Mode B: replay_summary.json  (per-episode, written at end of replay)
@@ -225,10 +235,10 @@ def main() -> None:
         df.to_csv(csv_path, index=False)
         print(f"[aggregate] wrote {len(df)} rows → {csv_path}")
 
-        cell_agg = aggregate_by_cell(df, numeric_cols, count_key="n_episodes")
+        cell_agg = aggregate_by_cell(df, numeric_cols, count_key="n_episodes", cells=cells)
 
         # Add success stats
-        for cell in CELLS:
+        for cell in cells:
             group = df[df["uncertainty_cell"] == cell]
             if not group.empty and "is_success" in group.columns:
                 n = len(group)
@@ -240,7 +250,7 @@ def main() -> None:
         json_path.write_text(json.dumps(cell_agg, indent=2))
         print(f"[aggregate] wrote {json_path}")
 
-        print_summary_table(cell_agg, numeric_cols, count_key="n_episodes")
+        print_summary_table(cell_agg, numeric_cols, count_key="n_episodes", cells=cells)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ export TORCH_HUB_ROOT=$TORCH_HOME
 export PIP_CACHE_DIR=$BASE_UTILS_DIR/cache/pip
 
 # export the CUDA HOME PATH
-export CUDA_HOME=$CONDA_PREFIX
+export CUDA_HOME=${CONDA_PREFIX:-""}
 
 # export cache directory for UV package manager
 export UV_CACHE_DIR=$BASE_UTILS_DIR/cache/uv
