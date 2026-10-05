@@ -1,17 +1,13 @@
 #!/bin/bash
 #
-#SBATCH --job-name=replay-droid-manual-check
+#SBATCH --job-name=replay-droid-manual-check-bootstrap-v1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=ailab
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
-<<<<<<< HEAD
-#SBATCH --time=2:00:00
-=======
 #SBATCH --time=8:00:00
->>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
 #SBATCH --output=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/AM43/yx2653/projects/UQ_Data_Collection/open-world/logs/%x-%j.err
 
@@ -28,20 +24,21 @@ source scripts/setup.bash
 # Disable online W&B
 export WANDB_MODE=offline
 
-<<<<<<< HEAD
-# Same checkpoint as jobs/replay_droid_wm_traj_epi_false_future.sh -- this job
-# only differs in WHICH episodes get replayed: hand-collected trajectories,
+# Uses the bootstrap-v1 checkpoint (the from-scratch, four-way-mix run -- see
+# configs/training/droid_wm_uq_bootstrap_v1.py; companion to
+# droid_wm_uq_bootstrap_only_v1.py's short warm-started ablation, evaluated by
+# jobs/replay_droid_wm_traj_manual_check_bootstrap_only_v1.sh). This job also
+# differs in WHICH episodes get replayed: hand-collected trajectories,
 # imported via scripts/import_manual_droid_episode.py, instead of
 # droid_ctrl_world's held-out val split.
-CKPT_DIR="checkpoints/wm_droid/droid_flow_matching_uq_false_future_v1"
-=======
-# Uses the v3 checkpoint (jobs/replay_droid_wm_traj_epi_false_future.sh still
-# uses v1) -- this job also differs in WHICH episodes get replayed:
-# hand-collected trajectories, imported via
-# scripts/import_manual_droid_episode.py, instead of droid_ctrl_world's
-# held-out val split.
-CKPT_DIR="checkpoints/wm_droid/droid_flow_matching_uq_false_future_v3"
->>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
+#
+# bootstrap_v1 is trained from scratch (ckpt_path=None, matching v3's own
+# from-scratch choice) with the SAME zero_overlap_action=True,
+# mask_history_from_peek=True settings as v3/bootstrap_only_v1, so this eval
+# needs the same two flags below. NOTE: as of this job's creation, training is
+# still in progress -- this picks up whatever the latest checkpoint is, which
+# may not be the final one.
+CKPT_DIR="checkpoints/wm_droid/droid_flow_matching_uq_bootstrap_v1"
 CKPT=$(ls -t "${CKPT_DIR}"/checkpoint-*.pt 2>/dev/null | head -1)
 if [ -z "${CKPT}" ]; then
     echo "ERROR: no checkpoint found in ${CKPT_DIR}"
@@ -72,27 +69,12 @@ uv run scripts/import_manual_droid_episode.py \
     --data_root "${DATA_ROOT}" \
     --suite "${SUITE}" \
     --split val \
-<<<<<<< HEAD
-    --svd_model_path external/svd_weights \
-=======
     --svd_model_path external/stable-video-diffusion-img2vid \
->>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
     --height 192 --width 320
 
 # ===== REPLAY (epistemic UQ: future_overlap / same-range self-consistency) =====
-# Same args as jobs/replay_droid_wm_traj_epi_false_future.sh EXCEPT:
-#   --suites droid_manual_uq_check --split val  (new hand-collected suite)
-#   --down_sample 1  (NOT 3 -- these episodes have camera/state captured at the
-#     SAME native rate, unlike droid_ctrl_world's pre-decimated training data;
-#     see openworld/utils/droid_export.py's module docstring CAUTION section)
-#   --history_source gt  (NOT the default "rolled" -- these hand-collected
-#     episodes are few and short, so we want every chunk graded against the
-#     TRUE history/future instead of a closed-loop rollout of the model's own
-#     prior predictions. This also turns each episode into many independent
-#     (true-history, true-future) windows rather than one long autoregressive
-#     chain, which is what we actually want for a per-window fidelity/UQ check
-#     against hand-picked quadrant labels. Does not change future_overlap's
-#     pass-2 peek, which stays pass-1's own predicted future by design.)
+# Same args as jobs/replay_droid_wm_traj_manual_check.sh (v3 variant) EXCEPT
+# the checkpoint -- see CKPT_DIR above.
 uv run scripts/replay_libero_wm_traj.py \
     --checkpoint "${CKPT}" \
     --data_root "${DATA_ROOT}" \
@@ -107,12 +89,8 @@ uv run scripts/replay_libero_wm_traj.py \
     --uq_vis_t_targets 0.9 0.5 0.1 \
     --uq_epi_mode future_overlap \
     --epi_overlap_k 0 \
-<<<<<<< HEAD
-    --overlap_zero_action
-=======
     --overlap_zero_action \
     --mask_history_from_peek
->>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
 
 # ===== PER-QUADRANT AGGREGATION + PLOT =====
 # Groups chunk_metrics.jsonl by the uncertainty_cell each episode's own

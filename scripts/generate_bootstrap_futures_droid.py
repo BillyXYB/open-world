@@ -15,17 +15,22 @@ scratch. The frozen sampler here is the existing
 Phase-A training run is needed (see
 configs/training/droid_wm_uq_bootstrap_v1.py's module docstring).
 
-For each covered ``(episode_id, frame_now)`` anchor, and for EACH possible
-``skip`` a training sample might later draw for its own true future
-(``dataset.py``: ``skip = random.randint(1, 2)``):
-  1. Build the SAME history/current/action conditioning a true (non-overlap)
-     training sample would use at that anchor AND that skip -- matching
-     ``dataset.py``'s ``_build_frame_ids`` exactly (history stride
+For each covered ``(episode_id, frame_now)`` anchor:
+  1. Draw ONE ``skip`` (1 or 2) at random -- matching the SAME distribution
+     ``dataset.py``'s ``_build_frame_ids`` draws for a training sample's own
+     true future (``skip = random.randint(1, 2)``) -- and build the SAME
+     history/current/action conditioning a true (non-overlap) training
+     sample would use at that anchor and skip (history stride
      ``skip_his = skip*4``, or 0 w.p. 0.15) via ``build_frame_ids``.
-  2. Run the frozen checkpoint's flow-matching sampler with NO peek
-     (``overlap_k=0, overlap_active=False``) -- a single, plain forward
-     sample conditioned on real history+actions, starting from pure noise.
-     This is what makes the result a harder distractor than
+  2. Run the frozen checkpoint's flow-matching sampler with NO REAL peek
+     content but the checkpoint's trained fixed-length sequence (see
+     ``--mask_history_from_peek``, default True to match
+     ``droid_flow_matching_uq_false_future_v3``: zero-pad ``history``/
+     ``action`` with ``num_frames-1`` placeholder slots and pass
+     ``overlap_k=num_frames-1, overlap_active=False`` -- mirrors
+     ``replay_libero_wm_traj.py``'s pass-1 exactly) -- a single, plain
+     forward sample conditioned on real history+actions, starting from pure
+     noise. This is what makes the result a harder distractor than
      p_false_future/p_shifted_future: it looks like a plausible continuation
      of THIS trajectory (real history, real actions), but is only a
      stochastic sample -- not guaranteed to match the true outcome.
@@ -34,22 +39,20 @@ For each covered ``(episode_id, frame_now)`` anchor, and for EACH possible
      ``<output_root>/<dataset_name>/<episode_id>/<frame_now>_skip<skip>.pt``
      (half precision, matching push_cube's cache).
 
-Why BOTH skip variants, not just one: at train time, ``dataset.py``'s
-``use_bootstrap_future`` branch loads whichever skip=1/skip=2 cache file
-matches the SPECIFIC training sample's own randomly-drawn ``skip`` (see its
-docstring) -- because the peek's implied timestamps (``frame_now +
-i*skip``) must match what that sample's true future actually represents at
-its own cadence. Caching only one skip variant would mean a random ~50% of
-samples that draw the OTHER skip silently miss the cache and fall back to
-the (easier) other-episode distractor -- generating both variants per
-anchor guarantees a timestep-exact match whenever that anchor was covered
-at all, at the cost of ~2x the generation compute per anchor. ``skip_his``
-(history stride) is NOT part of the cache key: it only affects how good/
-representative the CONDITIONING was during generation, not what timestamps
-the OUTPUT represents (the real GT history is always loaded fresh at train
-time regardless of what the generation script used) -- so it's drawn
-per-variant matching the training distribution, but doesn't need its own
-key.
+Only ONE skip variant per anchor, not both: this random per-anchor draw
+means training doesn't get to independently draw ITS OWN skip and hope for
+a cache hit -- instead, ``dataset.py``'s ``use_bootstrap_future`` branch
+checks which skip variant is cached for an anchor BEFORE building that
+sample's own true future, and FORCES the true future to be built at that
+same skip (see ``_build_frame_ids``'s ``forced_skip`` param) -- so the peek
+and the target always represent identical timestamps, guaranteed by
+construction rather than by chance, at no extra generation cost (the
+cache's skip was itself drawn uniformly at random here, so forcing the
+consumer to match it introduces no bias). ``skip_his`` (history stride) is
+NOT part of the cache key: it only affects how good/representative the
+CONDITIONING was during generation, not what timestamps the OUTPUT
+represents (the real GT history is always loaded fresh at train time
+regardless of what the generation script used).
 
 DROID's ``train_sample.json`` has ~8.7M rows across ~94k episodes -- far too
 large for full coverage (unlike push_cube's bootstrap cache, which covers
@@ -57,10 +60,10 @@ every group). Use ``--every_nth_episode``/``--anchors_per_episode``/
 ``--shard_id``/``--num_shards`` (a plain SLURM array job, see
 ``jobs/generate_bootstrap_futures_droid_array.sh`` -- no submitit dependency
 in this repo, unlike wm_uq/) to generate a bounded subset; dataset.py
-gracefully falls back to the other-episode distractor for any (anchor, skip)
-combination not found in the cache. The cache is resumable (skip-if-exists,
-checked per skip variant independently), so scaling up coverage later is
-additive, not wasted work.
+gracefully falls back to the other-episode distractor for any anchor with no
+cached variant at all. The cache is resumable (skip-if-exists -- an anchor
+with EITHER skip variant already cached is skipped), so scaling up coverage
+later is additive, not wasted work.
 
 Usage (smoke test, no SLURM):
     uv run scripts/generate_bootstrap_futures_droid.py \\
@@ -78,8 +81,8 @@ Breadth-first coverage: ``--every_nth_episode 1 --anchors_per_episode K``
 covers ALL selected episodes with up to K base anchors each (evenly spaced
 across each episode's timeline), instead of full-density coverage of a
 random episode subset -- see ``--anchors_per_episode``'s help. Each base
-anchor still expands into up to 2 (skip=1, skip=2) generation calls per the
-above.
+anchor is exactly one generation call (one randomly-drawn skip variant, per
+the above).
 
 Batch-size note (found via --sweep_batch_sizes on an H200, torch 2.10.0+cu128):
 letting PyTorch auto-select the SDPA backend crashes with "CUDA error:
@@ -121,8 +124,9 @@ from openworld.training.world_model.config import LiberoWMArgs  # noqa: E402
 from openworld.training.world_model.dataset import _load_stat, LiberoLatentDataset  # noqa: E402
 
 # The only two `skip` values dataset.py's _build_frame_ids ever draws
-# (random.randint(1, 2)) for a sample's own true future -- see module
-# docstring's "Why BOTH skip variants" section.
+# (random.randint(1, 2)) for a sample's own true future -- one is chosen
+# randomly per anchor below (see module docstring's "Only ONE skip variant
+# per anchor" section).
 SKIP_VALUES = (1, 2)
 # Matches dataset.py's _build_frame_ids exactly: skip_his = skip*4, then
 # overridden to 0 with this probability (simulates "only the immediately
@@ -209,7 +213,11 @@ def _build_batch_conditioning(
 
     history = torch.stack(history_list, 0)   # (B, num_history, 4, total_h, latent_w)
     current = torch.stack(current_list, 0)   # (B, 4, total_h, latent_w)
-    action = torch.stack(action_list, 0)     # (B, num_history+1, action_dim)
+    action = torch.stack(action_list, 0)     # (B, num_history+num_frames, action_dim) -- covers the
+                                              # FULL rgb_id window (history+current+future), since
+                                              # actions are known/given conditioning even for the
+                                              # future frames being sampled; only the video latent
+                                              # itself is truncated to history+current above.
     return history, current, action, text_list
 
 
@@ -223,6 +231,37 @@ def _run_batch(
     history = history.to(device)
     current = current.to(device)
     action = action.to(device)
+
+    # Match droid_flow_matching_uq_false_future_v3's mask_history_from_peek=True
+    # training architecture. Its training ALWAYS reserves num_frames-1 peek
+    # slots in the frame sequence -- zero-padded + fully masked when there's
+    # no real peek content this step -- so the TOTAL sequence length (and
+    # hence every frame's position embedding, per pipeline_flow_map_ctrl_world
+    # .predict_v: `torch.cat([history, latent_model_input], dim=1)`, total
+    # length = history.shape[1] + num_frames) is CONSTANT across every
+    # training step regardless of whether a real peek fires. `overlap_k`
+    # alone does NOT insert padding -- it only controls the attention MASK
+    # (attention_masks.py); the caller must physically append the zero
+    # slots to `history`/`action` itself. Without this, a "no peek" inference
+    # call (overlap_k=0, unpadded history) runs the model at a sequence
+    # length num_frames-1 SHORTER than anything it was ever trained on --
+    # not a minor discrepancy, exactly the position-embedding confound
+    # mask_history_from_peek exists to eliminate. Mirrors
+    # replay_libero_wm_traj.py's pass-1 padding exactly (same checkpoint,
+    # same "no real peek" scenario).
+    max_overlap_slots = a.num_frames - 1
+    if a.mask_history_from_peek:
+        B = history.shape[0]
+        pad_latents = torch.zeros(B, max_overlap_slots, *history.shape[2:],
+                                   dtype=history.dtype, device=device)
+        history = torch.cat([history, pad_latents], dim=1)
+        pad_action = torch.zeros(B, max_overlap_slots, action.shape[-1],
+                                  dtype=action.dtype, device=device)
+        action = torch.cat([action[:, :a.num_history], pad_action, action[:, a.num_history:]], dim=1)
+        overlap_k = max_overlap_slots
+    else:
+        overlap_k = 0
+
     # EFFICIENT_ATTENTION forced explicitly -- see module docstring's
     # "Batch-size note": the SDPA auto-dispatcher crashes at larger batch
     # sizes by picking FLASH_ATTENTION/CUDNN_ATTENTION for an attention call
@@ -245,7 +284,9 @@ def _run_batch(
             frame_level_cond=args_ns.frame_level_cond, his_cond_zero=False,
             flow_map_type=args_ns.flow_map_type, flow_map_loss_type=args_ns.flow_map_loss_type,
             return_uncertainty=False, generator=gen,
-            overlap_k=0, overlap_active=False,  # no peek -- plain sample from real history+actions
+            overlap_k=overlap_k, overlap_active=False,  # no real peek -- plain sample from
+            # real history+actions, but with the trained checkpoint's fixed-length
+            # (zero-padded, masked) peek slots reserved when mask_history_from_peek
         )
     return pred_latents.float().cpu()
 
@@ -343,18 +384,17 @@ def main() -> None:
                         "selected) and this set to a small number, EVERY episode gets touched "
                         "instead of a random subset getting full-density coverage while the rest "
                         "get none -- e.g. --anchors_per_episode 2 covers all ~94k DROID train "
-                        "episodes with up to 2 base anchors each (each expanding into up to 2 "
-                        "skip variants -- see module docstring -- so ~360k generation calls "
-                        "total) rather than full-density coverage of a ~2%% episode subset. Base "
-                        "anchors are chosen EVENLY SPACED across each episode's valid frame_now "
-                        "range (not just the first K), so coverage spans the episode's timeline "
-                        "rather than clustering near its start.")
+                        "episodes with up to 2 base anchors each (one generation call per base "
+                        "anchor -- see module docstring -- so ~180k generation calls total) "
+                        "rather than full-density coverage of a ~2%% episode subset. Base anchors "
+                        "are chosen EVENLY SPACED across each episode's valid frame_now range "
+                        "(not just the first K), so coverage spans the episode's timeline rather "
+                        "than clustering near its start.")
     p.add_argument("--shard_id", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--max_anchors", type=int, default=0,
-                   help="Cap total (anchor, skip) generation calls this run (0 = no cap; each "
-                        "base anchor contributes up to len(SKIP_VALUES)=2 calls). Useful for a "
-                        "smoke test.")
+                   help="Cap total (anchor, skip) generation calls this run (0 = no cap; one call "
+                        "per base anchor). Useful for a smoke test.")
     p.add_argument("--batch_size", type=int, default=32,
                    help="Anchors per forward call (may span multiple episodes AND skip variants "
                         "-- GPU efficiency, unlike push_cube's one-at-a-time script). 32 is the "
@@ -376,6 +416,16 @@ def main() -> None:
     p.add_argument("--down_sample", type=int, default=3)
     p.add_argument("--num_history", type=int, default=6)
     p.add_argument("--num_frames", type=int, default=5)
+    p.add_argument("--mask_history_from_peek", action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match the frozen sampler checkpoint's training setting -- default "
+                        "True since droid_flow_matching_uq_false_future_v3 (the intended sampler) "
+                        "was trained with mask_history_from_peek=True, meaning it ALWAYS reserves "
+                        "num_frames-1 zero-padded peek slots in the sequence, even with no real "
+                        "peek content. This script replicates that padding (see _run_batch) so "
+                        "generation runs at the SAME total sequence length the checkpoint was "
+                        "trained on, matching replay_libero_wm_traj.py's pass-1 exactly. Pass "
+                        "--no-mask_history_from_peek only if pointing this at an older checkpoint "
+                        "(e.g. v1/v2) trained without this flag.")
     p.add_argument("--sweep_batch_sizes", default=None,
                    help="Comma-separated batch sizes to benchmark (e.g. '8,16,32,64'). When set, "
                         "loads the model ONCE, then times the SAME first --sweep_anchors anchors "
@@ -441,22 +491,29 @@ def main() -> None:
           + (f" ({n_capped_episodes}/{len(selected_episodes)} episodes capped to "
              f"<= {a.anchors_per_episode} each)" if a.anchors_per_episode > 0 else ""))
 
-    # Expand each base anchor into up to len(SKIP_VALUES) generation calls --
-    # one per possible skip a training sample might later draw for its own
-    # true future -- skipping (episode, frame_now, skip) combinations
-    # already cached (resumable, see module docstring). skip_his is drawn
-    # fresh per call, matching dataset.py's exact distribution.
+    # Generate exactly ONE skip variant per base anchor -- drawn randomly,
+    # matching dataset.py's own 1-or-2 distribution -- rather than both.
+    # Generating both would double compute for an exact timestep match at
+    # train time; not worth it, since p_shifted_future/p_false_future
+    # already accept the same kind of imprecision (their windows are always
+    # stride-1 regardless of the consuming sample's own drawn skip).
+    # dataset.py's use_bootstrap_future branch prefers an exact match
+    # against the consuming sample's own skip when available, and otherwise
+    # falls back to whichever ONE variant IS cached here -- see its
+    # docstring. Skips (episode, frame_now) combinations where EITHER skip
+    # variant is already cached (resumable, see module docstring).
+    # skip_his is drawn fresh per call, matching dataset.py's exact
+    # distribution.
     anchors: list[tuple[str, int, int, int]] = []
     for ep, frame_now in base_anchors:
-        for skip in SKIP_VALUES:
-            cache_path = out_root / ep / f"{frame_now}_skip{skip}.pt"
-            if cache_path.exists():
-                continue
-            anchors.append((ep, frame_now, skip, _draw_skip_his(skip)))
+        if any((out_root / ep / f"{frame_now}_skip{s}.pt").exists() for s in SKIP_VALUES):
+            continue
+        skip = random.choice(SKIP_VALUES)
+        anchors.append((ep, frame_now, skip, _draw_skip_his(skip)))
     if a.max_anchors > 0:
         anchors = anchors[: a.max_anchors]
     print(f"[gen_bootstrap] {len(anchors)} (anchor, skip) generation calls "
-          f"to run (after skip-if-exists, up to {len(SKIP_VALUES)} skip variants each)")
+          f"to run (after skip-if-exists, 1 skip variant per anchor)")
 
     ann_cache: dict[str, dict] = {}
 

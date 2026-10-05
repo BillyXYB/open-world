@@ -202,7 +202,8 @@ def main() -> None:
 
     # 2x2 bar charts for primary metrics
     for metric in ["mean_aleatoric_var", "mean_epi_ltv", "mean_epi_var",
-                   "mean_kl", "t0.9_mean_aleatoric_var", "t0.9_mean_epi_ltv"]:
+                   "mean_kl", "t0.9_mean_aleatoric_var", "t0.9_mean_epi_ltv",
+                   "mean_epi_var_signed"]:
         if metric in df.columns:
             bar_2x2(df, metric, output_dir / f"bar2x2_{metric}.png",
                     cells=bar_2x2_cells, cell_colors=cell_colors)

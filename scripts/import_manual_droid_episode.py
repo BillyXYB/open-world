@@ -17,7 +17,11 @@ Usage:
         --data_root /scratch/gpfs/AM43/yy4041/data \
         --suite droid_manual_uq_check \
         --split val \
+<<<<<<< HEAD
         --svd_model_path external/svd_weights   # same path used elsewhere for LatentEncoder
+=======
+        --svd_model_path external/stable-video-diffusion-img2vid
+>>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
 """
 
 import argparse
@@ -57,6 +61,23 @@ def ensure_stat_json(data_root: Path, suite: str, reference_suite: str = "droid_
     print(f"[*] Bootstrapped {stat_path} from {ref_path} (reusing '{reference_suite}' normalization stats).")
 
 
+<<<<<<< HEAD
+=======
+def find_imported_source_bundles(data_root: Path, suite: str, split: str) -> dict:
+    """Map source_bundle path (str) -> episode_id for every already-imported episode in
+    <data_root>/<suite>/annotation/<split>/*.json, so re-running this script against the
+    same bundle_dir can skip bundles it already imported instead of duplicating them under
+    a new episode id (next_episode_id() has no content-awareness of its own)."""
+    ann_dir = data_root / suite / "annotation" / split
+    imported: dict = {}
+    for p in sorted(ann_dir.glob("*.json")) if ann_dir.exists() else []:
+        source_bundle = json.loads(p.read_text()).get("source_bundle")
+        if source_bundle is not None:
+            imported[source_bundle] = p.stem
+    return imported
+
+
+>>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
 def import_bundle(bundle_path: Path, *, data_root: Path, suite: str, split: str, encoder) -> None:
     data = np.load(bundle_path / "bundle.npz")
     meta = json.loads((bundle_path / "meta.json").read_text())
@@ -120,7 +141,17 @@ def main() -> None:
     if not bundle_dirs:
         raise FileNotFoundError(f"No bundle.npz found under {args.bundle_dir}")
 
+<<<<<<< HEAD
     for bundle_path in bundle_dirs:
+=======
+    already_imported = find_imported_source_bundles(args.data_root, args.suite, args.split)
+    for bundle_path in bundle_dirs:
+        existing_id = already_imported.get(str(bundle_path))
+        if existing_id is not None:
+            print(f"[*] Skipping '{bundle_path.name}' -- already imported as "
+                  f"{args.suite}/{args.split}/{existing_id}")
+            continue
+>>>>>>> c0514f6f70a2654a1789a187ec2dc6a3226faf47
         import_bundle(bundle_path, data_root=args.data_root, suite=args.suite, split=args.split, encoder=encoder)
 
 

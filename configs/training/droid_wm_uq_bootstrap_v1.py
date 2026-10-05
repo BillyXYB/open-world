@@ -1,5 +1,6 @@
-"""DROID world-model training config: bootstrap distractor v1, on top of
-``droid_flow_matching_uq_false_future_v3``.
+"""DROID world-model training config: bootstrap distractor v1, trained from
+raw SVD (see below), reusing ``droid_flow_matching_uq_false_future_v3``'s
+checkpoint only as the frozen bootstrap-future sampler.
 
 v1-v3 of the false-future/UQ line (configs/training/droid_wm_uq_false_future_v3.py
 and its own module docstring) already established that the history-future-overlap
@@ -34,23 +35,23 @@ but is only a stochastic sample, not guaranteed correct -- forcing the logvar
 head to actually judge plausibility instead of detecting an episode/time
 mismatch.
 
-Unlike push_cube's Phase A (trained from scratch, ctx_mask_prob=1.0, purely
-to serve as an unbiased frozen sampler), this config REUSES the existing
-droid_flow_matching_uq_false_future_v3 checkpoint (checkpoint-220000.pt) as
-BOTH the frozen sampler (see the generation script) AND the warm-start
-weights for this run -- v3 already has the masked-peek architecture
-(mask_history_from_peek=True) and reasonable DROID generation quality, so
-there is no need to train a separate Phase-A-equivalent model from scratch
-(confirmed decision -- saves ~220k steps of compute). This makes the run
-effectively "Phase B only".
+droid_flow_matching_uq_false_future_v3's checkpoint (checkpoint-220000.pt)
+still serves as the frozen sampler that generated the bootstrap-future cache
+(scripts/generate_bootstrap_futures_droid.py, independent of this file --
+that script hardcodes its own --checkpoint and is unaffected by anything
+below). This config itself, however, trains from raw SVD rather than
+warm-starting from v3 (ckpt_path=None, matching v3's own from-scratch choice
+-- see v3's module docstring on why warm-starting risks baking in a
+pre-existing shortcut): the bootstrap distractor is a big enough change to
+the training distribution (a fourth, harder content-plausibility negative
+present from step 0) that isolating its effect is cleaner from a fresh run
+than compounded on top of v3's own already-collapsed weights. This also
+sidesteps needing to first establish whether v3's weights would adapt
+cleanly to a distribution they never saw during their own training.
 
-ckpt_path is a bare state_dict load (see train_wm.py) -- NOT a full resume:
-global_step, optimizer state, and the LR schedule all restart from 0.
-max_train_steps=40_000 (vs v3's 500_000 budget / 220k actual steps trained)
-mirrors push_cube's Phase A -> Phase B step-budget ratio (100k -> 40k):
-this run's checkpoint-40000.pt therefore represents 220k (v3) + 40k
-(this run) = 260k real steps total, not 40k -- a bookkeeping point only,
-since global_step itself starts at 0.
+max_train_steps=220_000 matches v3's own actual trained duration (not its
+500_000 configured budget) for an apples-to-apples step count between the
+two runs.
 
 Mixing scheme (conditional on p_history_future_overlap=0.5 firing, unchanged
 from v3): p_shifted_future and p_false_future are each reduced from v3's
@@ -58,18 +59,22 @@ from v3): p_shifted_future and p_false_future are each reduced from v3's
 in-run baseline against the pre-bootstrap collapse behavior), and
 p_bootstrap_future=0.40 takes the largest share of the reallocated budget
 since it's the mechanism actually targeting the collapse. Implicit true-peek
-share drops from v3's 0.50 to 0.30. NOTE: because bootstrap_cache_root can
-only ever hold PARTIAL coverage of DROID's ~8.7M-sample train split (dataset.py
-falls back to the other-episode distractor on a cache miss), the REALIZED
-p_bootstrap_future rate will be diluted below 0.40 by the cache miss rate --
-scale up the cache's coverage fraction (scripts/generate_bootstrap_futures_droid.py)
-if that dilution turns out to make the eval signal inconclusive.
+share drops from v3's 0.50 to 0.30. bootstrap_cache_root can only ever hold
+PARTIAL coverage of DROID's ~8.7M-sample train split, but dataset.py draws the
+bootstrap-selected training example directly FROM the cached-anchor index
+(built once in __init__) rather than drawing a row uniformly and checking it
+for a cache hit -- so the realized p_bootstrap_future rate matches 0.40
+exactly regardless of coverage fraction (it only falls back to the
+other-episode distractor if the cache is entirely empty). This does mean
+bootstrap-negative examples are drawn from a smaller pool of distinct
+(episode, frame_now) anchors than the other distractor types -- scale up
+anchors_per_episode (scripts/generate_bootstrap_futures_droid.py) if that
+narrower anchor diversity turns out to matter for the eval signal.
 
 Everything else (architecture, p_history_future_overlap, mask_history_from_peek,
 zero_overlap_action, fixed_overlap_k, dataset, compute settings) is unchanged
-from v3 -- this isolates the new distractor axis as the only change under
-test, and keeps the warm start a clean continuation rather than a second
-distribution shift on top of v3's own masking change.
+from v3 -- this isolates the new distractor axis plus the from-scratch
+restart as the only changes under test.
 
 IMPORTANT -- eval/inference compatibility: same flags as v3
 (--mask_history_from_peek --overlap_zero_action --epi_overlap_k 0), since
@@ -84,8 +89,6 @@ import os
 
 from openworld.training.world_model.config import LiberoWMArgs
 
-_V3_CKPT_DIR = "checkpoints/wm_droid/droid_flow_matching_uq_false_future_v3"
-
 
 def get_args() -> LiberoWMArgs:
     data_root = "/scratch/gpfs/AM43/yy4041/data"
@@ -93,10 +96,9 @@ def get_args() -> LiberoWMArgs:
         # ----- Paths (set these to your installation) -----
         svd_model_path="external/stable-video-diffusion-img2vid",
         clip_model_path="external/clip-vit-base-patch32",
-        # Warm start from v3's final checkpoint -- bare state_dict load (see
-        # train_wm.py), NOT a full resume. See module docstring re: v3 as
-        # both frozen sampler and warm-start weights.
-        ckpt_path=os.path.join(_V3_CKPT_DIR, "checkpoint-220000.pt"),
+        # Train from raw SVD -- see module docstring for why this run does
+        # NOT warm-start from v3 (unlike an earlier version of this config).
+        ckpt_path=None,
 
         # ----- Dataset: reuse vidwm's existing droid_ctrl_world data -----
         dataset_root_path=data_root,
@@ -114,7 +116,7 @@ def get_args() -> LiberoWMArgs:
 
         # ----- Schedule -----
         learning_rate=1e-5,
-        max_train_steps=40_000,   # Phase-B-style reduced budget -- see module docstring
+        max_train_steps=220_000,  # matches v3's actual trained step count -- see module docstring
         checkpointing_steps=10_000,
         validation_steps=10_000,
         max_grad_norm=1.0,
